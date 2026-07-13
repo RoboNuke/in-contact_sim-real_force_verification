@@ -32,6 +32,15 @@ parser.add_argument(
 parser.add_argument("--kp_z", type=float, default=300.0, help="z proportional gain action (N/m).")
 parser.add_argument("--log_every", type=int, default=10, help="Print telemetry every N steps.")
 parser.add_argument(
+    "--log_physics", action="store_true", help="Record per-physics-step data into the env logger."
+)
+parser.add_argument(
+    "--log_out",
+    type=str,
+    default="physics_log.npz",
+    help="Where to save the physics log (.npz) when --log_physics is set.",
+)
+parser.add_argument(
     "--delta_z",
     action="store_true",
     help="Use delta-from-current z control (constant-force, FORGE/Factory convention) instead of "
@@ -63,6 +72,7 @@ def main() -> None:
     print("[drive] parsing env cfg...", flush=True)
     env_cfg = parse_env_cfg("Isaac-ContactForceTest-Direct-v0", device=args.device, num_envs=args.num_envs)
     env_cfg.ctrl.z_target_absolute = not args.delta_z
+    env_cfg.log_physics = args.log_physics
     print("[drive] building env (gym.make -> scene setup)...", flush=True)
     env = gym.make("Isaac-ContactForceTest-Direct-v0", cfg=env_cfg, render_mode=None)
     print("[drive] env built.", flush=True)
@@ -100,7 +110,7 @@ def main() -> None:
             box_top_z = u.fixed_pos[:, 2] + box_size_z / 2.0
             gap = (tip_z - box_top_z) * 1000.0  # mm
 
-            contact_fz = u.contact_force_w[:, 2].mean().item()  # world, up on cylinder
+            contact_fz = u.contact_force_ee[:, 2].mean().item()  # EE frame
             meas_fz = u.est_force_ee_meas[:, 2].mean().item()  # measured torque, pinv(J^T)
             dyn_fz = u.est_force_ee_dyn[:, 2].mean().item()  # measured torque, dyn-consistent inv
 
@@ -110,6 +120,14 @@ def main() -> None:
                 f"est_Fz_pinv={meas_fz:+8.3f}  est_Fz_dynconsistent={dyn_fz:+8.3f}",
                 flush=True,
             )
+
+    if args.log_physics and u.physics_logger is not None:
+        u.physics_logger.save(args.log_out)
+        print(
+            f"[drive] saved {len(u.physics_logger)} physics-step records to {args.log_out} "
+            f"(fields: {sorted(u.physics_logger.as_dict().keys())})",
+            flush=True,
+        )
 
     env.close()
 

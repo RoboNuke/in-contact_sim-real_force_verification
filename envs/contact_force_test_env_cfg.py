@@ -135,9 +135,10 @@ class ContactForceTestTask(FactoryTask):
 class ContactForceTestEnvCfg(FactoryEnvCfg):
     """Top-level env cfg. Inherits Factory's sim / physx / robot / scene."""
 
-    # action = [delta_z_target, kp_z]. obs/state dims are set in the env __init__.
+    # action = [a_z, kp_z]. obs/state dims are set in the env __init__.
     action_space: int = 2
-    observation_space: int = 6  # [contact_force_w(3), est_force_ee(3)]
+    # [contact_force_w(3), est_force_ee_meas(3, pinv), est_force_ee_dyn(3, dyn-consistent)]
+    observation_space: int = 9
     state_space: int = 0
 
     obs_order: list = []
@@ -153,3 +154,7 @@ class ContactForceTestEnvCfg(FactoryEnvCfg):
 
     # Same episode length as FORGE PegInsert (10 s @ 15 Hz = 150 steps).
     episode_length_s: float = 10.0
+
+    # When True, record per-physics-step data into env.physics_logger (120 Hz,
+    # i.e. every substep, not every policy step). See envs/physics_logger.py.
+    log_physics: bool = False

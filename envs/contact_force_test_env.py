@@ -31,16 +31,18 @@ from isaaclab_tasks.direct.factory import factory_utils
 from isaaclab_tasks.direct.factory.factory_env import FactoryEnv
 
 from .contact_force_test_env_cfg import ContactForceTestEnvCfg
+from .physics_logger import PhysicsDataLogger
 
 
 class ContactForceTestEnv(FactoryEnv):
     cfg: ContactForceTestEnvCfg
 
     def __init__(self, cfg: ContactForceTestEnvCfg, render_mode: str | None = None, **kwargs):
-        # Our observation is two 3-vector force readings; there is no asymmetric
+        # Our observation is three 3-vector force readings (contact sensor,
+        # pinv(J^T)·tau_measured, and dyn-consistent·tau_measured); no asymmetric
         # critic state. Set the spaces directly and bypass FactoryEnv.__init__'s
         # obs_order-based recompute (we don't use the Factory obs layout).
-        cfg.observation_space = 6
+        cfg.observation_space = 9
         cfg.state_space = 0
         self.cfg_task = cfg.task
 
@@ -64,6 +66,9 @@ class ContactForceTestEnv(FactoryEnv):
         factory_utils.set_body_inertias(self._robot, self.scene.num_envs)
         self._init_tensors()
         self._set_default_dynamics_parameters()
+
+        # Optional per-physics-step data logger (records inside _apply_action).
+        self.physics_logger = PhysicsDataLogger() if cfg.log_physics else None
 
     # ------------------------------------------------------------------
     # Scene: robot + parametric cylinder/box primitives + contact sensor
@@ -189,6 +194,7 @@ class ContactForceTestEnv(FactoryEnv):
         z3 = lambda: torch.zeros((self.num_envs, 3), device=self.device)  # noqa: E731
         # Force readings (populated in _compute_intermediate_values).
         self.contact_force_w = z3()
+        self.contact_force_ee = z3()
         self.est_force_w = z3()
         self.est_force_ee = z3()
         self.est_force_w_meas = z3()
@@ -215,6 +221,11 @@ class ContactForceTestEnv(FactoryEnv):
     def _compute_intermediate_values(self, dt):
         super()._compute_intermediate_values(dt)
         self.contact_force_w = self._read_contact_force()
+        # Contact force rotated into the EE frame (so all three force readings
+        # share a frame in the observation).
+        self.contact_force_ee = torch_utils.quat_apply(
+            torch_utils.quat_conjugate(self.fingertip_midpoint_quat), self.contact_force_w
+        )
 
         # Two joint-torque signals mapped to an EE force via pinv(J^T)·tau:
         #   measured  = get_dof_projected_joint_forces() — the physics solver's
@@ -225,8 +236,12 @@ class ContactForceTestEnv(FactoryEnv):
         #   commanded = applied actuator effort (robot.data.applied_torque). This
         #               is what the controller asked for; mapping it back returns
         #               the commanded task wrench plus null-space leakage.
-        tau_measured = self._robot.root_physx_view.get_dof_projected_joint_forces()[:, 0:7]
-        tau_commanded = self._robot.data.applied_torque[:, 0:7]
+        # Full per-joint torques (kept for the physics logger); the arm 7 are used
+        # for the EE force estimates.
+        self.joint_torque_measured = self._robot.root_physx_view.get_dof_projected_joint_forces()
+        self.joint_torque_applied = self._robot.data.applied_torque
+        tau_measured = self.joint_torque_measured[:, 0:7]
+        tau_commanded = self.joint_torque_applied[:, 0:7]
 
         self.est_force_w_meas, self.est_force_ee_meas = self._map_torque_to_ee_force(tau_measured)
         self.est_force_w_cmd, self.est_force_ee_cmd = self._map_torque_to_ee_force(tau_commanded)
@@ -241,12 +256,18 @@ class ContactForceTestEnv(FactoryEnv):
             self.est_force_w, self.est_force_ee = self.est_force_w_meas, self.est_force_ee_meas
 
     def _read_contact_force(self) -> torch.Tensor:
-        """Net held<->fixed contact force (world frame), summed over contact pairs."""
+        """Net contact force the held cylinder exerts ON the fixed box (world frame).
+
+        ``force_matrix_w`` reports the force ON the held body FROM the fixed body
+        (the reaction, box->cylinder). We negate it so its sign matches the
+        joint-torque estimates: positive = pressing into the surface.
+        """
         fmat = self._contact_sensor.data.force_matrix_w
         if fmat is None:
             return torch.zeros((self.num_envs, 3), device=self.device)
-        # (num_envs, num_bodies, num_filters, 3) -> (num_envs, 3)
-        return fmat.sum(dim=(1, 2))
+        # (num_envs, num_bodies, num_filters, 3) -> (num_envs, 3); negate to the
+        # "force applied to the surface" convention.
+        return -fmat.sum(dim=(1, 2))
 
     def _map_torque_to_ee_force(self, tau: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Map a 7-DOF arm joint torque to an EE force: tau = J^T·F => F = pinv(J^T)·tau.
@@ -334,11 +355,40 @@ class ContactForceTestEnv(FactoryEnv):
             ctrl_target_gripper_dof_pos=0.0,
         )
 
+        # Log this physics substep (state at substep start + the action applied).
+        if self.physics_logger is not None:
+            self._log_physics_step(z_goal=target_pos[:, 2], kp_z=kp_z)
+
+    def _log_physics_step(self, z_goal, kp_z):
+        """Record one physics-step sample into the data logger (per-env tensors)."""
+        self.physics_logger.record(
+            self._robot._data._sim_timestamp,
+            joint_pos=self.joint_pos,  # (N, 9)
+            joint_vel=self.joint_vel,  # (N, 9)
+            joint_torque_applied=self.joint_torque_applied,  # (N, 9) actuator effort
+            joint_torque_measured=self.joint_torque_measured,  # (N, 9) projected joint force
+            mass_matrix=self.arm_mass_matrix,  # (N, 7, 7)
+            jacobian=self.fingertip_midpoint_jacobian,  # (N, 6, 7)
+            ee_pos=self.fingertip_midpoint_pos,  # (N, 3)
+            ee_quat=self.fingertip_midpoint_quat,  # (N, 4)
+            ee_linvel=self.fingertip_midpoint_linvel,  # (N, 3)
+            ee_angvel=self.fingertip_midpoint_angvel,  # (N, 3)
+            contact_force_ee=self.contact_force_ee,  # (N, 3)
+            est_force_ee_pinv=self.est_force_ee_meas,  # (N, 3)
+            est_force_ee_dynconsistent=self.est_force_ee_dyn,  # (N, 3)
+            action_pos_goal=z_goal.unsqueeze(-1),  # (N, 1) commanded fingertip z target
+            action_stiffness=kp_z.unsqueeze(-1),  # (N, 1) z proportional gain
+        )
+
     # ------------------------------------------------------------------
     # Observations / rewards / reset
     # ------------------------------------------------------------------
     def _get_observations(self):
-        obs = torch.cat([self.contact_force_w, self.est_force_ee], dim=-1)
+        # Three force readings, all in the EE frame (each x/y/z): contact sensor,
+        # pinv(J^T)·tau_measured, dyn-consistent·tau_measured.
+        obs = torch.cat(
+            [self.contact_force_ee, self.est_force_ee_meas, self.est_force_ee_dyn], dim=-1
+        )
         return {"policy": obs}
 
     def _get_rewards(self):
