@@ -63,6 +63,23 @@ class ContactTestCtrlCfg(CtrlCfg):
     #   "commanded" -> robot.data.applied_torque: the applied actuator effort.
     joint_torque_source: str = "measured"
 
+    # What the z action controls:
+    #   "position" -> a_z is a position goal (see z_target_absolute); z task
+    #                 wrench = kp * (z_goal - z) - kd * z_vel (the PD above).
+    #   "force"    -> a_z is an ABSOLUTE z force target; z task wrench =
+    #                 kp * (f_target - f_measured) (pure-proportional force
+    #                 control, per the reference hybrid-force-position law).
+    #                 x/y and orientation stay position-controlled at their reset
+    #                 pose. kp (the action's stiffness) is reused as the force gain.
+    control_mode: str = "position"
+    # Force signal used as feedback in "force" mode (all EE frame, +=pressing):
+    #   "contact" -> contact sensor;  "pinv" -> pinv(J^T)·tau;  "dyn" -> J̄^T·tau.
+    force_feedback: str = "contact"
+    # Saturation on the force-control wrench (N). Caps kp*(f_target - f_measured)
+    # so contact acquisition can't slam/tunnel; inactive near equilibrium (where
+    # the wrench ~ f_target), so it doesn't bias the steady-state force.
+    force_wrench_bound: float = 50.0
+
 
 @configclass
 class CylinderHeldAssetCfg(HeldAssetCfg):
@@ -72,6 +89,10 @@ class CylinderHeldAssetCfg(HeldAssetCfg):
     height: float = 0.05  # cylinder length (m)
     mass: float = 0.019
     friction: float = 0.75
+
+    # Contact params (swept by scripts/param_sweep.py). Defaults == FORGE/Factory.
+    contact_offset: float = 0.005  # m; collision margin at which contacts generate
+    max_depenetration_velocity: float = 5.0  # m/s; solver penetration-recovery cap
 
 
 @configclass
@@ -90,6 +111,10 @@ class BoxFixedAssetCfg(FixedAssetCfg):
     friction: float = 0.75
     # The box is a kinematic rigid body (immovable). See _build_fixed_cfg.
 
+    # Contact params (swept by scripts/param_sweep.py). Defaults == FORGE/Factory.
+    contact_offset: float = 0.005  # m; collision margin at which contacts generate
+    max_depenetration_velocity: float = 5.0  # m/s; solver penetration-recovery cap
+
 
 @configclass
 class ContactForceTestTask(FactoryTask):
@@ -104,8 +129,9 @@ class ContactForceTestTask(FactoryTask):
     fixed_asset_cfg: BoxFixedAssetCfg = BoxFixedAssetCfg()
     held_asset_cfg: CylinderHeldAssetCfg = CylinderHeldAssetCfg()
 
-    # Cylinder tip sits this far above the box top surface at reset (m).
-    tip_gap: float = 0.003
+    # Cylinder tip sits this far above the box top surface at reset (m). Kept
+    # small so force control has almost no runway to accelerate before contact.
+    tip_gap: float = 0.0002
 
     # Empirical fingertip-placement residual: with rel_z=0 the grasp settles the
     # cylinder center ~this far below the fingertip frame, so the tip lands

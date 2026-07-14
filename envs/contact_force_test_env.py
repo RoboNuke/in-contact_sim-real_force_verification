@@ -27,9 +27,10 @@ from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
-from isaaclab_tasks.direct.factory import factory_utils
+from isaaclab_tasks.direct.factory import factory_control, factory_utils
 from isaaclab_tasks.direct.factory.factory_env import FactoryEnv
 
+from . import factory_control_utils
 from .contact_force_test_env_cfg import ContactForceTestEnvCfg
 from .physics_logger import PhysicsDataLogger
 
@@ -141,7 +142,7 @@ class ContactForceTestEnv(FactoryEnv):
                 activate_contact_sensors=True,
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
                     disable_gravity=True,
-                    max_depenetration_velocity=5.0,
+                    max_depenetration_velocity=held.max_depenetration_velocity,
                     linear_damping=0.0,
                     angular_damping=0.0,
                     max_linear_velocity=1000.0,
@@ -152,7 +153,7 @@ class ContactForceTestEnv(FactoryEnv):
                     max_contact_impulse=1e32,
                 ),
                 mass_props=sim_utils.MassPropertiesCfg(mass=held.mass),
-                collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.005, rest_offset=0.0),
+                collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=held.contact_offset, rest_offset=0.0),
                 physics_material=sim_utils.RigidBodyMaterialCfg(
                     static_friction=held.friction, dynamic_friction=held.friction, restitution=0.0
                 ),
@@ -171,13 +172,13 @@ class ContactForceTestEnv(FactoryEnv):
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
                     kinematic_enabled=True,
                     disable_gravity=True,
-                    max_depenetration_velocity=5.0,
+                    max_depenetration_velocity=fixed.max_depenetration_velocity,
                     solver_position_iteration_count=192,
                     solver_velocity_iteration_count=1,
                     max_contact_impulse=1e32,
                 ),
                 mass_props=sim_utils.MassPropertiesCfg(mass=fixed.mass),
-                collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.005, rest_offset=0.0),
+                collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=fixed.contact_offset, rest_offset=0.0),
                 physics_material=sim_utils.RigidBodyMaterialCfg(
                     static_friction=fixed.friction, dynamic_friction=fixed.friction, restitution=0.0
                 ),
@@ -323,27 +324,36 @@ class ContactForceTestEnv(FactoryEnv):
         return rel_pos, rel_quat
 
     # ------------------------------------------------------------------
-    # Action: z-only task-space PD.  action = [delta_z_target, kp_z]
+    # Action: [a_z, kp].  a_z is a z position goal (control_mode="position")
+    # or a z force target (control_mode="force"); kp is the stiffness / force
+    # gain. x/y and orientation are always held at their reset pose.
     # ------------------------------------------------------------------
     def _apply_action(self):
         if self.last_update_timestamp < self._robot._data._sim_timestamp:
             self._compute_intermediate_values(dt=self.physics_dt)
 
-        dz = self.actions[:, 0] * self.cfg.ctrl.z_action_scale
-        dz = torch.clip(dz, -self.cfg.ctrl.z_action_bound, self.cfg.ctrl.z_action_bound)
-        kp_z = self.actions[:, 1]
+        goal = self.actions[:, 0]  # z position goal (rel surface) OR z force target
+        kp = self.actions[:, 1]  # stiffness / force gain
 
-        # Position target: x/y frozen at reset. z reference is either the
-        # surface-referenced fingertip z (absolute: dz is the tip height relative
-        # to the box top surface, dz=0 => tip on surface) or the current fingertip
-        # z (delta / constant-force), per cfg.ctrl.z_target_absolute.
+        if self.cfg.ctrl.control_mode == "force":
+            self._apply_force_control(force_target=goal, kp_force=kp)
+        else:
+            self._apply_position_control(a_z=goal, kp_z=kp)
+
+        # Log this physics substep (state at substep start + the action applied).
+        if self.physics_logger is not None:
+            self._log_physics_step()
+
+    def _apply_position_control(self, a_z, kp_z):
+        """z position PD: target z = z reference + clip(a_z*scale); x/y/orn frozen."""
+        dz = torch.clip(
+            a_z * self.cfg.ctrl.z_action_scale, -self.cfg.ctrl.z_action_bound, self.cfg.ctrl.z_action_bound
+        )
         target_pos = self.init_fingertip_pos.clone()
         z_ref = self.surface_fingertip_ref if self.cfg.ctrl.z_target_absolute else self.fingertip_midpoint_pos[:, 2]
         target_pos[:, 2] = z_ref + dz
-        # Orientation target: frozen at reset.
         target_quat = self.init_fingertip_quat.clone()
 
-        # Gains: x/y/rot from cfg defaults, z from the action; kd critically damped.
         prop_gains = self.default_gains.clone()
         prop_gains[:, 2] = kp_z
         self.task_prop_gains = prop_gains
@@ -355,11 +365,74 @@ class ContactForceTestEnv(FactoryEnv):
             ctrl_target_gripper_dof_pos=0.0,
         )
 
-        # Log this physics substep (state at substep start + the action applied).
-        if self.physics_logger is not None:
-            self._log_physics_step(z_goal=target_pos[:, 2], kp_z=kp_z)
+    def _apply_force_control(self, force_target, kp_force):
+        """z force control: z task wrench = kp * (f_target - f_measured).
 
-    def _log_physics_step(self, z_goal, kp_z):
+        Pure-proportional force control (the reference hybrid-force-position law).
+        x/y and orientation are held at the reset pose by the position PD; only
+        the vertical axis is replaced by the force term.
+        """
+        # (1) Pose-PD wrench holding x/y + reset orientation (world frame, 6D).
+        target_pos = self.init_fingertip_pos.clone()
+        target_quat = self.init_fingertip_quat.clone()
+        prop_gains = self.default_gains.clone()  # x/y/rot position gains
+        deriv_gains = factory_utils.get_deriv_gains(prop_gains)
+        task_wrench = self._pose_wrench(target_pos, target_quat, prop_gains, deriv_gains)
+
+        # (2) Force wrench along the pressing axis (EE +z), saturated so contact
+        # acquisition can't slam/tunnel, then rotated to world.
+        f_meas = self._force_feedback()[:, 2]  # EE z, + = pressing
+        bound = self.cfg.ctrl.force_wrench_bound
+        force_ee = torch.zeros((self.num_envs, 3), device=self.device)
+        force_ee[:, 2] = torch.clip(kp_force * (force_target - f_meas), -bound, bound)
+        force_world = torch_utils.quat_apply(self.fingertip_midpoint_quat, force_ee)  # (N, 3)
+
+        # (3) Replace the world-vertical linear wrench with the force term; keep
+        # x/y and orientation from the pose PD (EE z ~ world z for the upright tool).
+        task_wrench[:, 2] = force_world[:, 2]
+
+        self.task_prop_gains = prop_gains
+        self.task_deriv_gains = deriv_gains
+        self.joint_torque, self.applied_wrench = factory_control_utils.compute_dof_torque_from_wrench(
+            cfg=self.cfg,
+            dof_pos=self.joint_pos,
+            dof_vel=self.joint_vel,
+            task_wrench=task_wrench,
+            jacobian=self.fingertip_midpoint_jacobian,
+            arm_mass_matrix=self.arm_mass_matrix,
+            device=self.device,
+        )
+        # Keep the gripper closed (position-controlled), like generate_ctrl_signals.
+        self.ctrl_target_joint_pos[:, 7:9] = 0.0
+        self.joint_torque[:, 7:9] = 0.0
+        self._robot.set_joint_position_target(self.ctrl_target_joint_pos)
+        self._robot.set_joint_effort_target(self.joint_torque)
+
+    def _pose_wrench(self, target_pos, target_quat, prop_gains, deriv_gains):
+        """Task-space PD wrench (world frame, 6D) toward a target pose."""
+        pos_error, axis_angle_error = factory_control.get_pose_error(
+            fingertip_midpoint_pos=self.fingertip_midpoint_pos,
+            fingertip_midpoint_quat=self.fingertip_midpoint_quat,
+            ctrl_target_fingertip_midpoint_pos=target_pos,
+            ctrl_target_fingertip_midpoint_quat=target_quat,
+            jacobian_type="geometric",
+            rot_error_type="axis_angle",
+        )
+        delta_pose = torch.cat((pos_error, axis_angle_error), dim=1)
+        return factory_control._apply_task_space_gains(
+            delta_pose, self.fingertip_midpoint_linvel, self.fingertip_midpoint_angvel, prop_gains, deriv_gains
+        )
+
+    def _force_feedback(self):
+        """The force signal (EE frame) that drives the force controller."""
+        source = self.cfg.ctrl.force_feedback
+        if source == "pinv":
+            return self.est_force_ee_meas
+        if source == "dyn":
+            return self.est_force_ee_dyn
+        return self.contact_force_ee
+
+    def _log_physics_step(self):
         """Record one physics-step sample into the data logger (per-env tensors)."""
         self.physics_logger.record(
             self._robot._data._sim_timestamp,
@@ -376,8 +449,8 @@ class ContactForceTestEnv(FactoryEnv):
             contact_force_ee=self.contact_force_ee,  # (N, 3)
             est_force_ee_pinv=self.est_force_ee_meas,  # (N, 3)
             est_force_ee_dynconsistent=self.est_force_ee_dyn,  # (N, 3)
-            action_pos_goal=z_goal.unsqueeze(-1),  # (N, 1) commanded fingertip z target
-            action_stiffness=kp_z.unsqueeze(-1),  # (N, 1) z proportional gain
+            action_goal=self.actions[:, 0:1],  # (N, 1) z position goal or force target
+            action_stiffness=self.actions[:, 1:2],  # (N, 1) stiffness / force gain
         )
 
     # ------------------------------------------------------------------
