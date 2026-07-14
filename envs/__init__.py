@@ -8,6 +8,7 @@ the Isaac Lab ``AppLauncher`` has booted.
 import gymnasium as gym
 
 from .contact_force_test_env_cfg import ContactForceTestEnvCfg
+from .forge_contact_test_env_cfg import ForgeContactTestEnvCfg
 
 gym.register(
     id="Isaac-ContactForceTest-Direct-v0",
@@ -15,5 +16,14 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": ContactForceTestEnvCfg,
+    },
+)
+
+gym.register(
+    id="Isaac-ForgeContactTest-Direct-v0",
+    entry_point="envs.forge_contact_test_env:ForgeContactTestEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": ForgeContactTestEnvCfg,
     },
 )
