@@ -31,6 +31,13 @@ import time
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Run one contact-force param-sweep condition.")
+parser.add_argument(
+    "--task",
+    type=str,
+    default="Isaac-ContactForceTest-Direct-v0",
+    help="Gym id: Isaac-ContactForceTest-Direct-v0 (cylinder/box) or "
+    "Isaac-ForgeContactTest-Direct-v0 (FORGE peg/hole).",
+)
 # --- the four swept parameters (this process = one grid point) ---
 parser.add_argument("--solver_iters", type=int, required=True, help="solver_position_iteration_count.")
 parser.add_argument("--max_depen", type=float, required=True, help="max_depenetration_velocity (m/s).")
@@ -78,7 +85,7 @@ sys.path.insert(0, _PROJECT_ROOT)
 import envs  # noqa: F401,E402  registers Isaac-ContactForceTest-Direct-v0
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
-TASK = "Isaac-ContactForceTest-Direct-v0"
+TASK = args.task
 
 
 def _fmt(x) -> str:
@@ -101,12 +108,24 @@ def main() -> None:
     #    be overridden by the robot articulation, which shares the contact island.
     env_cfg.sim.physx.min_position_iteration_count = args.solver_iters
     env_cfg.sim.physx.max_position_iteration_count = args.solver_iters
-    # 3) max_depenetration_velocity and 4) contact_offset, on both contacting
-    #    bodies (held cylinder + fixed box), via the cfg fields the env reads.
-    env_cfg.task.held_asset_cfg.max_depenetration_velocity = args.max_depen
-    env_cfg.task.fixed_asset_cfg.max_depenetration_velocity = args.max_depen
-    env_cfg.task.held_asset_cfg.contact_offset = args.contact_offset
-    env_cfg.task.fixed_asset_cfg.contact_offset = args.contact_offset
+    # 3) max_depenetration_velocity and 4) contact_offset, on both contacting bodies.
+    #    Set them on the config BEFORE the env is built, two ways so it works for
+    #    both envs: the primitive cylinder/box reads *_asset_cfg in _build_*_cfg,
+    #    while the FORGE peg/hole spawn straight from USD ArticulationCfgs -- so set
+    #    the spawn's collision_props/rigid_props directly too. Both are harmless
+    #    where unused, so the env just loads with the right values.
+    for asset_cfg in (env_cfg.task.held_asset_cfg, env_cfg.task.fixed_asset_cfg):
+        asset_cfg.contact_offset = args.contact_offset
+        asset_cfg.max_depenetration_velocity = args.max_depen
+    for name in ("held_asset", "fixed_asset"):
+        art_cfg = getattr(env_cfg.task, name, None)
+        spawn = getattr(art_cfg, "spawn", None)
+        if spawn is None:
+            continue
+        if getattr(spawn, "collision_props", None) is not None:
+            spawn.collision_props.contact_offset = args.contact_offset
+        if getattr(spawn, "rigid_props", None) is not None:
+            spawn.rigid_props.max_depenetration_velocity = args.max_depen
 
     # ---- Position controller, surface-referenced absolute setpoint ----
     env_cfg.ctrl.control_mode = "position"

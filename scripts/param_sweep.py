@@ -25,6 +25,7 @@ Python that can import Isaac Lab::
     python scripts/param_sweep.py
 """
 
+import argparse
 import datetime
 import json
 import os
@@ -46,9 +47,26 @@ SECONDS = 2.0
 FORCES = "1,2,5,10,15"
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT_DIR = os.path.join(_PROJECT_ROOT, "data", "param_sweep")
 RUNNER = os.path.join(_PROJECT_ROOT, "scripts", "param_sweep_run.py")
-CONFIG_SRC = os.path.join(_PROJECT_ROOT, "envs", "contact_force_test_env_cfg.py")
+
+_p = argparse.ArgumentParser(description="Orchestrate the contact-force parameter sweep.")
+_p.add_argument("--task", default="Isaac-ContactForceTest-Direct-v0",
+                help="Gym id: Isaac-ContactForceTest-Direct-v0 (cylinder/box) or "
+                     "Isaac-ForgeContactTest-Direct-v0 (FORGE peg/hole).")
+_p.add_argument("--out_dir", default=None,
+                help="Output dir for .npz. Default: data/param_sweep_forge for the FORGE "
+                     "task, else data/param_sweep.")
+_p.add_argument("--config_src", default=None,
+                help="Config file snapshotted into out_dir. Default: matches the task.")
+ARGS = _p.parse_args()
+
+TASK = ARGS.task
+_IS_FORGE = "Forge" in TASK
+OUT_DIR = ARGS.out_dir or os.path.join(
+    _PROJECT_ROOT, "data", "param_sweep_forge" if _IS_FORGE else "param_sweep")
+CONFIG_SRC = ARGS.config_src or os.path.join(
+    _PROJECT_ROOT, "envs",
+    "forge_contact_test_env_cfg.py" if _IS_FORGE else "contact_force_test_env_cfg.py")
 
 
 def _fmt(x) -> str:
@@ -63,9 +81,10 @@ def main() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
 
     # Snapshot the config used for this sweep + a manifest of the grid.
-    shutil.copy2(CONFIG_SRC, os.path.join(OUT_DIR, "contact_force_test_env_cfg.py"))
+    shutil.copy2(CONFIG_SRC, os.path.join(OUT_DIR, os.path.basename(CONFIG_SRC)))
     manifest = {
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "task": TASK,
         "solver_position_iteration_count": SOLVER_ITERS,
         "max_depenetration_velocity": MAX_DEPEN,
         "sim_dt_denominators": DT_DENOMS,
@@ -85,7 +104,7 @@ def main() -> None:
         json.dump(manifest, fh, indent=2)
 
     total = len(DT_DENOMS) * len(SOLVER_ITERS) * len(MAX_DEPEN) * len(CONTACT_OFFSETS)
-    print(f"[sweep] {total} conditions -> {OUT_DIR}", flush=True)
+    print(f"[sweep] task={TASK}  {total} conditions -> {OUT_DIR}", flush=True)
 
     done = skipped = failed = 0
     idx = 0
@@ -105,6 +124,7 @@ def main() -> None:
 
                     cmd = [
                         sys.executable, RUNNER, "--headless",
+                        "--task", TASK,
                         "--solver_iters", str(iters),
                         "--max_depen", str(max_depen),
                         "--dt_denom", str(dt_denom),

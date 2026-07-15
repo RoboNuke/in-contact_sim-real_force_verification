@@ -85,6 +85,10 @@ class ForgeContactTestEnv(ContactForceTestEnv):
             "/World/envs/env_.*/Table", table_cfg, translation=(0.55, 0.0, 0.0), orientation=(0.70711, 0.0, 0.0, 0.70711)
         )
 
+        # NOTE: contact_offset / max_depenetration_velocity are applied by the
+        # sweep runner onto the USD ArticulationCfg spawns (held_asset.spawn.*)
+        # BEFORE the env is built, so the peg/hole just load with the right values.
+
         self._robot = Articulation(self.cfg.robot)
         self._held_asset = Articulation(self.cfg_task.held_asset)  # FORGE peg
         self._fixed_asset = Articulation(self.cfg_task.fixed_asset)  # FORGE hole
