@@ -1,0 +1,63 @@
+# Real-robot contact-force test configuration (FR3).
+#
+# Mirrors the sim contact-force push test (scripts/param_sweep_run.py +
+# envs/contact_force_test_env.py) on real hardware, using the vendored
+# FrankaInterface. See real_robot_scripts/README.md.
+
+robot:
+  ip: "192.168.1.11"
+  use_mock: false             # true -> mock_pylibfranka (off-hardware dry run)
+  control_rate_hz: 15.0       # policy step rate; sim runs 15 Hz (dt=1/120, decim=8)
+  reset_duration_sec: 3.0     # Cartesian move time when returning to the start pose
+  gripper_force_n: 60.0       # grasp force (<= 70 N continuous limit)
+
+  # NE_T_EE / EE_T_K: identity. F_T_NE (set in Franka Desk) already contains
+  # R_z(-45 deg) + T_z(0.1034), which matches sim's panda_hand body frame, so
+  # O_T_EE / the Jacobian reference the fingertip midpoint with the sim
+  # orientation and forces are measured at the fingertip. Column-major 4x4.
+  NE_T_EE: [1.0, 0.0, 0.0, 0.0,  0.0, 1.0, 0.0, 0.0,  0.0, 0.0, 1.0, 0.0,  0.0, 0.0, 0.0, 1.0]
+  EE_T_K:  [1.0, 0.0, 0.0, 0.0,  0.0, 1.0, 0.0, 0.0,  0.0, 0.0, 1.0, 0.0,  0.0, 0.0, 0.0, 1.0]
+
+  # F/T EMA low-pass (applied at 1 kHz in the comm process). alpha=0.08 ~ 13 Hz.
+  ft_ema_alpha: 0.08
+
+  # Initial constant F/T bias. Left at zero: we re-tare (calibrate_ft_bias) in
+  # free space before every push, which overrides this.
+  ft_bias: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+  # Seconds of O_F_ext_hat_K averaged for each per-push tare.
+  ft_calibration_duration_sec: 2.0
+
+# ---------------------------------------------------------------------------
+# Experiment protocol (matches the sim sweep) + controller gains.
+# ---------------------------------------------------------------------------
+experiment:
+  forces_n: [1.0, 2.0, 5.0, 10.0, 15.0]   # target contact forces (N)
+  reps: 10                                 # repeats per force value
+  hold_seconds: 2.0                        # hold time at each push (sim: 2 s)
+
+  # Position/depth control: commanded z target = surface_ref_z - force/gain.
+  # gain is the z proportional gain (sim default_task_prop_gains[2]); rigid
+  # surface => settled force = gain * depth = force.
+  gain: 565.0
+
+  # Task-space PD prop gains [Fx,Fy,Fz,Tx,Ty,Tz]; must match sim
+  # ContactTestCtrlCfg.default_task_prop_gains. Deriv gains are computed as
+  # 2*sqrt(kp) (critical damping), matching factory_utils.get_deriv_gains.
+  prop_gains: [565.0, 565.0, 565.0, 28.0, 28.0, 28.0]
+
+  # Null-space (keep joints near the start config).
+  kp_null: 10.0
+  kd_null: 6.3245553
+
+  # Position clamp bounds about the start pose (m). Generous so the push
+  # (max depth 15/565 ~ 27 mm) is never clipped.
+  pos_bounds: [0.1, 0.1, 0.1]
+
+  # Retract distance after the whole run, to lift the peg clear (m).
+  retract_height_m: 0.03
+
+  # Clamp the peg once before the run (set false if using a fixed tool).
+  close_gripper: true
+
+  out_dir: "data/real_robot"
