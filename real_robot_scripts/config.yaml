@@ -36,6 +36,36 @@ experiment:
   reps: 10                                 # repeats per force value
   hold_seconds: 2.0                        # hold time at each push (sim: 2 s)
 
+  # After switching to torque control, hold the standoff pose still for this long
+  # before starting the data collection, so the mode-switch transient (the shake)
+  # settles out. Not included in the 15 Hz snapshot; the 1 kHz buffer keeps it.
+  settle_seconds: 0.5
+
+  # Surface reference: the EE/fingertip position (world frame) at which the peg
+  # tip just contacts the surface. If set, every push uses it instead of a
+  # hand-set pose (run once with surface_pos: null and paste the printed
+  # [start] surface_pos here). If null, it is captured from the current pose
+  # (position the tip on the surface by hand before running).
+  surface_pos: [0.609733521938324, 5.395615517045371e-05, 0.21568913757801056]                 # e.g. [0.55, 0.0, 0.20]
+
+  # Each push centers this far above the surface point (approach clearance and
+  # the F/T re-tare pose), then lowers to tip_gap_m above the surface before
+  # switching to torque control.
+  approach_height_m: 0.02
+
+  # Standoff above the surface at which the torque-control episode begins.
+  # Matches the sim's tip_gap (contact_force_test_env_cfg.py: tip_gap = 0.0002),
+  # so the real push has the same tiny runway to contact as sim.
+  tip_gap_m: 0.0002
+
+  # Force the held peg exactly upright. The start pose is set by hand, so its
+  # orientation may be slightly tilted; when true, the orientation is leveled so
+  # the tool axis points straight down (world -z) — keeping the hand-set x/y and
+  # yaw — so the push is purely vertical (matches the sim's straight-down peg).
+  # A tilt larger than upright_warn_deg prints a warning to re-check the pose.
+  force_upright: true
+  upright_warn_deg: 5.0
+
   # Position/depth control: commanded z target = surface_ref_z - force/gain.
   # gain is the z proportional gain (sim default_task_prop_gains[2]); rigid
   # surface => settled force = gain * depth = force.

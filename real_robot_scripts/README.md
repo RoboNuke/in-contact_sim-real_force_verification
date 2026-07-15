@@ -23,14 +23,21 @@ depends on that repo.
 
 ## What it does
 
-You place the peg tip at the surface by hand. Then, for each target force and
-each repeat, the script:
+The **surface reference** (the EE/fingertip position at which the peg tip
+contacts the surface) comes from `surface_pos` in the config, or is captured
+from a hand-set pose when `surface_pos: null`. The orientation is leveled
+**exactly upright** (tool axis straight down), so the push is purely vertical
+regardless of small tilts in the pose. Then, for each target force and each
+repeat — mirroring the sim reset — the script:
 
-1. returns to the pose you set (the surface / **force = 0 reference**),
-2. re-tares the F/T estimate in free space (`calibrate_ft_bias`),
-3. pushes straight down in **position control** to `z = surface_ref_z −
-   force/gain`, and
-4. holds `hold_seconds`, logging, then retracts to (1) for the next rep.
+1. centers `approach_height_m` (default **2 cm**) above the surface point,
+2. re-tares the F/T estimate in that free space (`calibrate_ft_bias`),
+3. lowers to `tip_gap_m` above the surface (the sim's **0.2 mm** `tip_gap`),
+4. switches to torque **position control** and holds the standoff pose still for
+   `settle_seconds` (default **0.5 s**, unlogged) so the mode-switch transient
+   settles, then
+5. pushes straight down to `z = surface_ref_z − force/gain`, holding
+   `hold_seconds` (2 s) while logging, then returns to (1) for the next rep.
 
 `gain` is the z proportional gain (default **565 N/m** — the sim
 `default_task_prop_gains[2]`). The surface is rigid, so the controller settles at
@@ -38,18 +45,30 @@ each repeat, the script:
 gain, which is known exactly. Defaults: forces `[1, 2, 5, 10, 15]` N × 10 reps =
 50 pushes, 2 s each.
 
-## Positioning procedure (before running)
+## Setting the surface reference
+
+**Preferred — fix it in the config.** Set `surface_pos: [x, y, z]` (world-frame
+EE position where the peg tip touches the surface). Every push then stages above
+it and lowers to the `tip_gap_m` standoff, with no hand-positioning between runs.
+To find the value: run once with `surface_pos: null` (procedure below) and paste
+the printed `[start] surface_pos` into the config.
+
+**Or capture it by hand** (`surface_pos: null`):
 
 1. Put the peg in the gripper (the script clamps it with `close_gripper`; use
    `--no_grip` for a fixed tool).
-2. Jog/hand-guide the robot so the peg tip is **just touching the surface**,
-   pointing straight down (roll ≈ π), at the spot you want to test. This pose
-   becomes the force = 0 reference for the whole run — place it carefully: at
-   1 N the commanded depth is only ~1.8 mm, so a 0.2 mm reference error is ~11 %
-   of the target. A hair of clearance (like the sim's 0.2 mm `tip_gap`) keeps the
-   per-rep tare contact-free.
-3. Run the script. It reads this pose once at start and returns to it between
-   every rep.
+2. Jog/hand-guide the robot so the peg tip is **just touching the surface** at
+   the spot you want to test (orientation is auto-leveled upright, so exact roll
+   isn't critical, but keep it near vertical). Place the z carefully: at 1 N the
+   commanded depth is only ~1.8 mm, so a 0.2 mm reference error is ~11 % of the
+   target.
+3. Run the script. It reads this position once at start; every rep then stages
+   `approach_height_m` above it and lowers to the `tip_gap_m` standoff before
+   pushing.
+
+Leveling can be disabled with `force_upright: false` (or `--no_upright`) to hold
+the pose orientation as-is; a tilt larger than `upright_warn_deg` prints a
+warning.
 
 ## Running
 
@@ -101,9 +120,11 @@ cell is a dict of the built-in high-rate buffer: `time_ms`, `ee_pos`, `ee_quat`,
 `np.load(path, allow_pickle=True)`.
 
 **Metadata:** `force_targets`, `depths`, `tare_bias (n_forces,n_reps,6)`,
-`meta_gain`, `prop_gains`, `control_rate_hz`, `hold_seconds`, `n_steps`, `reps`,
-`start_ee_pos/quat`, `start_joint_q`, `surface_ref_z`, `wall_time_total`,
-`use_mock`.
+`meta_gain`, `prop_gains`, `control_rate_hz`, `hold_seconds`, `n_steps`,
+`settle_seconds`, `settle_steps`, `reps`,
+`surface_pos` (= `start_ee_pos`), `start_ee_quat` (leveled) / `start_ee_quat_raw`
+(as captured), `start_joint_q`, `surface_ref_z`, `approach_height_m`,
+`tip_gap_m`, `wall_time_total`, `use_mock`.
 
 ## Safety / notes
 

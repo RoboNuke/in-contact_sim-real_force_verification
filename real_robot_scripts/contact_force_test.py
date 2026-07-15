@@ -1,16 +1,22 @@
 """Real-robot contact-force push test (FR3).
 
 The hardware analog of the sim sweep (``scripts/param_sweep_run.py`` driving
-``Isaac-ContactForceTest-Direct-v0``). You position the peg tip at the surface by
-hand; this script then, for each target force and each repeat:
+``Isaac-ContactForceTest-Direct-v0``). The surface reference (the EE/fingertip
+position at which the peg tip contacts the surface) comes from ``surface_pos``
+in the config, or is captured from a hand-set pose when that is ``null``. The
+orientation is leveled exactly upright (tool axis straight down). Then, for each
+target force and each repeat, mirroring the sim reset:
 
-  1. returns to the pose you set (the surface / force=0 reference),
-  2. re-tares the F/T estimate in free space (``calibrate_ft_bias``),
-  3. pushes straight down in **position control** to ``z = surface_ref_z -
-     force/gain`` (gain = the z proportional gain, default 565 N/m). The surface
-     is rigid, so the controller settles at ``force = gain * depth``.
-  4. holds for ``hold_seconds`` while logging, then retracts to (1) for the next
-     rep.
+  1. centers ``approach_height_m`` (default 2 cm) above the surface point,
+  2. re-tares the F/T estimate in that free space (``calibrate_ft_bias``),
+  3. lowers to ``tip_gap_m`` above the surface (the sim's ``tip_gap`` standoff),
+  4. switches to torque **position control** and holds the standoff pose still
+     for ``settle_seconds`` (default 0.5 s, unlogged) so the mode-switch
+     transient settles, then
+  5. pushes straight down to ``z = surface_ref_z - force/gain`` (gain = the z
+     proportional gain, default 565 N/m) for the ``hold_seconds`` (2 s) episode.
+     The surface is rigid, so the controller settles at ``force = gain * depth``.
+     Then it returns to (1) for the next rep.
 
 Force targets ``[1, 2, 5, 10, 15]`` N x 10 reps = 50 pushes by default. All the
 data the sim logs is collected (see the module docstring of
@@ -33,6 +39,7 @@ On the robot: position the peg, then::
 
 import argparse
 import datetime
+import math
 import os
 import sys
 import time
@@ -45,7 +52,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from real_robot_scripts.pro_robot_interface import FrankaInterface
 from real_robot_scripts.hybrid_controller import ControlTargets
-from real_robot_scripts.robot_interface import SafetyViolation
+from real_robot_scripts.robot_interface import (
+    SafetyViolation,
+    _rotation_matrix_to_quat_wxyz,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -72,6 +82,34 @@ def quat_to_rot_matrix(q: torch.Tensor) -> np.ndarray:
         [2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
         [2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y)],
     ])
+
+
+def level_quat_to_vertical(quat: torch.Tensor):
+    """Rotate ``quat`` so the tool/push axis (EE +z) points exactly straight
+    down (world -z), preserving the spin about that axis (yaw).
+
+    The peg is pushed straight down in world z, so it should be perfectly
+    vertical; this removes any roll/pitch tilt from the hand-set start pose
+    (which would otherwise tilt the push off world-z). The minimal (geodesic)
+    rotation that aligns the tool axis leaves the twist about that axis
+    unchanged, so the finger / x-y heading you set by hand is preserved.
+
+    Returns ``(leveled_quat (w,x,y,z), tilt_removed_deg)``.
+    """
+    R = torch.from_numpy(quat_to_rot_matrix(quat)).to(quat.dtype)  # world <- EE
+    a = R[:, 2] / torch.linalg.norm(R[:, 2])           # tool axis (EE +z) in world
+    t = torch.tensor([0.0, 0.0, -1.0], dtype=quat.dtype)  # straight down
+    c = float(torch.dot(a, t).clamp(-1.0, 1.0))
+    tilt_deg = math.degrees(math.acos(c))
+    v = torch.cross(a, t, dim=-1)
+    s = float(torch.linalg.norm(v))
+    if s < 1e-8:                                        # already vertical (or degenerate)
+        return quat.clone(), tilt_deg
+    vx = torch.tensor([[0.0, -v[2], v[1]],
+                       [v[2], 0.0, -v[0]],
+                       [-v[1], v[0], 0.0]], dtype=quat.dtype)
+    g = torch.eye(3, dtype=quat.dtype) + vx + vx @ vx * ((1.0 - c) / (s * s))
+    return _rotation_matrix_to_quat_wxyz(g @ R), tilt_deg
 
 
 def map_torque_to_ee_force_pinv(jacobian, tau, ee_quat):
@@ -148,25 +186,50 @@ def pose_to_matrix(ee_pos: torch.Tensor, ee_quat: torch.Tensor) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # One push (single force target, single rep).
 # --------------------------------------------------------------------------- #
-def run_one_push(robot, exp, force, start_pose_4x4, start_pos, start_quat,
-                 start_joint_q, surface_ref_z, n_steps):
-    """Return-to-start, re-tare, push to depth, hold n_steps, log 15 Hz + 1 kHz."""
+def run_one_push(robot, exp, force, surf_pos, surf_quat, standoff_pos,
+                 start_joint_q, approach_pose_4x4, standoff_pose_4x4,
+                 n_steps, settle_steps):
+    """Stage above the surface, re-tare, lower to the sim standoff, then switch
+    to torque control, settle in place, and push to depth for the episode.
+
+    Mirrors the sim reset: each rep centers ``approach_height_m`` above the
+    surface point, re-tares the F/T in that free space, lowers to ``tip_gap_m``
+    above the surface (the sim's ``tip_gap`` standoff), and only then switches to
+    torque control. It first holds the standoff pose still for ``settle_steps``
+    (``settle_seconds``) — unlogged — so the mode-switch transient dies out, then
+    commands the push and runs the 2 s ``force = gain * depth`` episode. Logs at
+    15 Hz (snapshot) and 1 kHz (built-in buffer).
+    """
     gain = float(exp["gain"])
     depth = force / gain                            # meters below the surface ref
+    surface_ref_z = float(surf_pos[2])
 
-    # (1) return to the surface/force=0 reference in free space
-    robot.reset_to_start_pose(start_pose_4x4)
+    # (1) center approach_height_m above the surface point (clearance / return pose)
+    robot.reset_to_start_pose(approach_pose_4x4)
 
-    # (2) re-tare the F/T estimate in free space at the start pose
+    # (2) re-tare the F/T estimate in free space up here
     tare_bias = robot.calibrate_ft_bias()
 
-    # (3) position target: same x/y/orientation, z = surface_ref - depth
-    target_pos = start_pos.clone()
-    target_pos[2] = surface_ref_z - depth
-    targets = make_position_targets(target_pos, start_quat, start_joint_q, exp)
+    # (3) lower to the sim standoff: tip sits tip_gap_m above the surface
+    robot.reset_to_start_pose(standoff_pose_4x4)
 
-    # (4) push + hold, logging at 15 Hz (snapshot) and 1 kHz (built-in buffer)
+    # (4) switch to torque control and settle: hold the standoff pose still for
+    # settle_steps so the mode-switch transient (the shake) dies out. Not logged
+    # in the 15 Hz snapshot; the 1 kHz buffer keeps this prefix (see settle_steps
+    # in the metadata) so it can be trimmed in analysis.
+    hold_targets = make_position_targets(standoff_pos, surf_quat, start_joint_q, exp)
     robot.start_torque_mode(log_trajectory=True)
+    for _ in range(settle_steps):
+        robot.set_control_targets(hold_targets)
+        robot.wait_for_policy_step()
+        robot.check_safety(robot.get_state_snapshot())
+
+    # (5) command the push; z target = surface_ref - depth (same x/y/orn) and
+    # collect the episode at 15 Hz (snapshot) + 1 kHz (built-in buffer).
+    target_pos = surf_pos.clone()
+    target_pos[2] = surface_ref_z - depth
+    targets = make_position_targets(target_pos, surf_quat, start_joint_q, exp)
+
     samples = []
     for _ in range(n_steps):
         robot.set_control_targets(targets)
@@ -227,6 +290,8 @@ def main():
     p.add_argument("--hold", type=float, default=None, help="Override hold seconds.")
     p.add_argument("--out_dir", default=None, help="Override output directory.")
     p.add_argument("--no_grip", action="store_true", help="Skip close_gripper().")
+    p.add_argument("--no_upright", action="store_true",
+                   help="Hold the hand-set orientation instead of leveling it upright.")
     args = p.parse_args()
 
     with open(args.config) as fh:
@@ -247,11 +312,14 @@ def main():
     reps = int(exp["reps"])
     rate = float(config["robot"]["control_rate_hz"])
     n_steps = int(round(exp["hold_seconds"] * rate))
+    settle_seconds = float(exp.get("settle_seconds", 0.5))
+    settle_steps = int(round(settle_seconds * rate))
 
     print("=" * 70)
     print("  REAL-ROBOT CONTACT-FORCE PUSH TEST")
     print(f"  robot={config['robot']['ip']} mock={config['robot']['use_mock']}")
-    print(f"  forces={forces} N   reps={reps}   hold={exp['hold_seconds']}s "
+    print(f"  forces={forces} N   reps={reps}   settle={settle_seconds}s "
+          f"({settle_steps} steps)   hold={exp['hold_seconds']}s "
           f"({n_steps} steps @ {rate} Hz)")
     print(f"  gain={exp['gain']}  depths(mm)="
           f"{[round(f / float(exp['gain']) * 1000, 2) for f in forces]}")
@@ -262,17 +330,56 @@ def main():
         if exp.get("close_gripper", True) and not args.no_grip:
             robot.close_gripper()
 
-        # Capture the start pose = the surface / force=0 reference. A brief
-        # zero-torque session packs the current state into shared memory.
+        # Capture the current state. A brief zero-torque session packs the
+        # current state into shared memory. Used for the joint config, and for
+        # the orientation (and, if surface_pos is not set in config, the
+        # surface reference position).
         robot.start_torque_mode()
         snap0 = robot.get_state_snapshot()
         robot.end_control()
-        start_pos = snap0.ee_pos.clone()
-        start_quat = snap0.ee_quat.clone()
+        cur_pos = snap0.ee_pos.clone()
+        start_quat_raw = snap0.ee_quat.clone()
         start_joint_q = snap0.joint_pos.clone()
-        surface_ref_z = float(start_pos[2])
-        start_pose_4x4 = pose_to_matrix(start_pos, start_quat)
-        print(f"[start] ee_pos={start_pos.tolist()}  surface_ref_z={surface_ref_z:.5f}")
+
+        # Force the held peg exactly upright: level the current orientation so
+        # the tool axis points straight down (world -z), keeping yaw. Guarantees
+        # the push is purely vertical regardless of small tilts in the pose.
+        # Disable with force_upright=false / --no_upright.
+        if exp.get("force_upright", True) and not args.no_upright:
+            start_quat, tilt_deg = level_quat_to_vertical(start_quat_raw)
+            warn = ("  *** exceeds warn threshold — re-check the pose ***"
+                    if tilt_deg > float(exp.get("upright_warn_deg", 5.0)) else "")
+            print(f"[start] leveling to upright: removed {tilt_deg:.2f} deg of tilt"
+                  f"{warn}")
+        else:
+            start_quat = start_quat_raw
+            print("[start] force_upright disabled — holding the current orientation")
+
+        # Surface reference position (EE/fingertip pos at which the peg tip
+        # contacts the surface). From config if surface_pos is set, else captured
+        # from the current (hand-set) pose.
+        surf_cfg = exp.get("surface_pos", None)
+        if surf_cfg is not None:
+            surf_pos = torch.tensor([float(v) for v in surf_cfg], dtype=cur_pos.dtype)
+            print(f"[start] surface_pos from config: {surf_pos.tolist()}")
+        else:
+            surf_pos = cur_pos
+            print(f"[start] surface_pos captured (hand-set): {surf_pos.tolist()}")
+        surface_ref_z = float(surf_pos[2])
+
+        # Staging heights: center approach_height_m above the surface, then lower
+        # to tip_gap_m above it (the sim's tip_gap) before switching to control.
+        approach_h = float(exp.get("approach_height_m", 0.02))
+        tip_gap = float(exp.get("tip_gap_m", 0.0002))
+        approach_pos = surf_pos.clone()
+        approach_pos[2] = surface_ref_z + approach_h
+        standoff_pos = surf_pos.clone()
+        standoff_pos[2] = surface_ref_z + tip_gap
+        approach_pose_4x4 = pose_to_matrix(approach_pos, start_quat)
+        standoff_pose_4x4 = pose_to_matrix(standoff_pos, start_quat)
+        print(f"[start] approach z={float(approach_pos[2]):.5f} (+{approach_h * 100:.1f} cm)  "
+              f"standoff z={float(standoff_pos[2]):.5f} (+{tip_gap * 1000:.2f} mm)  "
+              f"surface_ref_z={surface_ref_z:.5f}")
 
         all_samples, all_bias = [], []
         t0 = time.perf_counter()
@@ -282,8 +389,9 @@ def main():
             for r in range(reps):
                 print(f"[push] force={force:5.1f} N  rep={r + 1}/{reps} ...", flush=True)
                 samples, bias, depth, traj = run_one_push(
-                    robot, exp, force, start_pose_4x4, start_pos, start_quat,
-                    start_joint_q, surface_ref_z, n_steps)
+                    robot, exp, force, surf_pos, start_quat, standoff_pos,
+                    start_joint_q, approach_pose_4x4, standoff_pose_4x4,
+                    n_steps, settle_steps)
                 per_rep.append(samples)
                 all_bias.append(bias)
                 traj_1khz[fi, r] = traj
@@ -306,11 +414,17 @@ def main():
         out["control_rate_hz"] = np.asarray(rate)
         out["hold_seconds"] = np.asarray(float(exp["hold_seconds"]))
         out["n_steps"] = np.asarray(n_steps)
+        out["settle_seconds"] = np.asarray(settle_seconds)
+        out["settle_steps"] = np.asarray(settle_steps)
         out["reps"] = np.asarray(reps)
-        out["start_ee_pos"] = start_pos.cpu().numpy()
-        out["start_ee_quat"] = start_quat.cpu().numpy()
+        out["surface_pos"] = surf_pos.cpu().numpy()              # surface reference (EE frame)
+        out["start_ee_pos"] = surf_pos.cpu().numpy()             # alias (kept for compat)
+        out["start_ee_quat"] = start_quat.cpu().numpy()          # leveled (commanded)
+        out["start_ee_quat_raw"] = start_quat_raw.cpu().numpy()  # as captured
         out["start_joint_q"] = start_joint_q.cpu().numpy()
         out["surface_ref_z"] = np.asarray(surface_ref_z)
+        out["approach_height_m"] = np.asarray(approach_h)
+        out["tip_gap_m"] = np.asarray(tip_gap)
         out["wall_time_total"] = np.asarray(wall)
         out["use_mock"] = np.asarray(bool(config["robot"]["use_mock"]))
 
