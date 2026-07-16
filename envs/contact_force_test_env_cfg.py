@@ -41,6 +41,17 @@ class ContactTestCtrlCfg(CtrlCfg):
     # FORGE-parity default gains for the axes NOT driven by the action.
     default_task_prop_gains = [565.0, 565.0, 565.0, 28.0, 28.0, 28.0]
 
+    # Wrench -> joint-torque mapping.
+    #   False (default): tau_task = J^T @ wrench (plain J^T, the IsaacLab
+    #          compute_dof_torque behavior); realized static EE force = wrench.
+    #   True: tau_task = J^T @ Lambda @ wrench (task-space inertia weighted, the
+    #          real robot's original behavior); realized static EE force =
+    #          Lambda @ wrench, i.e. inflated by the ~5-7x EE inertia along the
+    #          push axis. The null-space posture term always uses the full Lambda
+    #          either way. The real-robot test has its own separate flag
+    #          (config.yaml experiment.mass_weighting).
+    mass_weighting: bool = False
+
     # No action smoothing — the test wants the commanded action applied directly.
     ema_factor = 1.0
 

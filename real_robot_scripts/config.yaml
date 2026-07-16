@@ -71,6 +71,16 @@ experiment:
   # surface => settled force = gain * depth = force.
   gain: 565.0
 
+  # Wrench -> joint-torque mapping.
+  #   true  : tau_task = J^T @ Lambda @ wrench (task-space inertia weighted).
+  #           The original real behavior; realized static force = Lambda @ wrench,
+  #           i.e. inflated by the ~5-7x end-effector inertia along the push axis.
+  #   false : tau_task = J^T @ wrench (plain J^T). Matches the sim controller
+  #           (IsaacLab compute_dof_torque), so realized static force = wrench.
+  # Set false to reproduce the sim's force scaling on hardware. (The sim has its
+  # own separate flag: ContactTestCtrlCfg.mass_weighting.)
+  mass_weighting: false
+
   # Task-space PD prop gains [Fx,Fy,Fz,Tx,Ty,Tz]; must match sim
   # ContactTestCtrlCfg.default_task_prop_gains. Deriv gains are computed as
   # 2*sqrt(kp) (critical damping), matching factory_utils.get_deriv_gains.

@@ -46,6 +46,8 @@ ControlTargets = namedtuple('ControlTargets', [
     'singularity_damping',  # float — Levenberg-Marquardt damping for J M^-1 J^T inverse (0.0 = disabled)
     'partial_inertia_decoupling',  # bool — separate 3x3 Lambda for pos/rot instead of coupled 6x6
     'sep_ori',  # bool — position via full Lambda (zeroed rot), rotation via direct J_rot^T (no Lambda)
+    'mass_weighting',  # bool — True: map wrench with J^T @ Lambda (task-space inertia weighted);
+                       # False: plain J^T (matches sim's default). See compute_joint_torques_from_wrench.
 ])
 
 
@@ -239,11 +241,23 @@ def compute_joint_torques_from_wrench(
     singularity_damping: float = 0.0,
     partial_inertia_decoupling: bool = False,
     sep_ori: bool = False,
+    mass_weighting: bool = True,
 ) -> torch.Tensor:
     """Compute joint torques via J^T @ Λ @ wrench with null-space compensation.
 
     Uses dynamically-consistent wrench mapping (J^T @ Λ) instead of plain J^T
     for configuration-independent task-space dynamics.
+
+    ``mass_weighting`` toggles that task-wrench mapping:
+        True  (default): tau_task = J^T @ Λ @ wrench (task-space inertia weighted;
+               the original real-robot behavior). The realized static EE force is
+               Λ @ wrench, i.e. inflated by the task-space inertia.
+        False: tau_task = J^T @ wrench (plain J^T; matches the sim's
+               ``compute_dof_torque``). The realized static EE force is the wrench
+               itself. The sep_ori / partial_inertia_decoupling branches are all
+               inertia-weighting variants, so they only apply when mass_weighting
+               is True. The null-space term always uses the full Λ (as the sim
+               does), regardless of this flag.
 
     Args:
         task_wrench: [6] task-space wrench.
@@ -277,7 +291,10 @@ def compute_joint_torques_from_wrench(
         JMJ_full = JMJ_full + singularity_damping * I6
     M_task_full = torch.inverse(JMJ_full)  # [6, 6]
 
-    if sep_ori:
+    if not mass_weighting:
+        # Plain J^T mapping (matches sim). No task-space inertia weighting.
+        jt_torque = jacobian_T @ task_wrench  # [7]
+    elif sep_ori:
         # Position: full Lambda with zeroed rotation wrench
         wrench_pos_only = torch.zeros(6, device=joint_pos.device, dtype=joint_pos.dtype)
         wrench_pos_only[0:3] = task_wrench[0:3]
@@ -437,6 +454,7 @@ def compute_torques_from_targets(
         joint_pos, joint_vel, targets.default_dof_pos,
         targets.kp_null, targets.kd_null, targets.singularity_damping,
         targets.partial_inertia_decoupling, targets.sep_ori,
+        targets.mass_weighting,
     )
     return joint_torques, task_wrench.clone(), jt_torque, null_torque
 
@@ -704,6 +722,12 @@ class RealRobotController:
                 "partial_inertia_decoupling and sep_ori are mutually exclusive — "
                 "set only one to true in control_gains"
             )
+
+        # Mass weighting: J^T @ Lambda (True, original real behavior) vs plain
+        # J^T (False, matches sim). See compute_joint_torques_from_wrench.
+        self.mass_weighting = gains_cfg.get('mass_weighting', True)
+        print(f"[RealRobotController] mass_weighting={self.mass_weighting} "
+              f"({'J^T @ Lambda (inertia-weighted)' if self.mass_weighting else 'plain J^T (sim-matched)'})")
 
         # State (initialized by reset())
         self.ema_actions = None
@@ -1053,6 +1077,7 @@ class RealRobotController:
             joint_pos, joint_vel, self.default_dof_pos,
             self.kp_null, self.kd_null, self.singularity_damping,
             self.partial_inertia_decoupling, self.sep_ori,
+            self.mass_weighting,
         )
 
         # ----------------------------------------------------------------
@@ -1086,6 +1111,7 @@ class RealRobotController:
             singularity_damping=self.singularity_damping,
             partial_inertia_decoupling=self.partial_inertia_decoupling,
             sep_ori=self.sep_ori,
+            mass_weighting=self.mass_weighting,
         )
 
         return {
@@ -1134,6 +1160,7 @@ def pack_control_targets(targets: ControlTargets) -> dict:
         'singularity_damping': float(targets.singularity_damping),
         'partial_inertia_decoupling': bool(targets.partial_inertia_decoupling),
         'sep_ori': bool(targets.sep_ori),
+        'mass_weighting': bool(targets.mass_weighting),
     }
 
 
@@ -1168,4 +1195,5 @@ def unpack_control_targets(data: dict, device: str = "cpu") -> ControlTargets:
         singularity_damping=data['singularity_damping'],
         partial_inertia_decoupling=data.get('partial_inertia_decoupling', False),
         sep_ori=data.get('sep_ori', False),
+        mass_weighting=data.get('mass_weighting', True),
     )

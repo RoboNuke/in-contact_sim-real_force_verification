@@ -359,11 +359,32 @@ class ContactForceTestEnv(FactoryEnv):
         self.task_prop_gains = prop_gains
         self.task_deriv_gains = factory_utils.get_deriv_gains(prop_gains)
 
-        self.generate_ctrl_signals(
-            ctrl_target_fingertip_midpoint_pos=target_pos,
-            ctrl_target_fingertip_midpoint_quat=target_quat,
-            ctrl_target_gripper_dof_pos=0.0,
-        )
+        if not self.cfg.ctrl.mass_weighting:
+            # Plain J^T (default): the IsaacLab compute_dof_torque path.
+            self.generate_ctrl_signals(
+                ctrl_target_fingertip_midpoint_pos=target_pos,
+                ctrl_target_fingertip_midpoint_quat=target_quat,
+                ctrl_target_gripper_dof_pos=0.0,
+            )
+        else:
+            # J^T @ Lambda (task-space inertia weighted): build the same pose-PD
+            # wrench compute_dof_torque would, then map it through the local util
+            # with mass_weighting on.
+            task_wrench = self._pose_wrench(target_pos, target_quat, prop_gains, self.task_deriv_gains)
+            self.joint_torque, self.applied_wrench = factory_control_utils.compute_dof_torque_from_wrench(
+                cfg=self.cfg,
+                dof_pos=self.joint_pos,
+                dof_vel=self.joint_vel,
+                task_wrench=task_wrench,
+                jacobian=self.fingertip_midpoint_jacobian,
+                arm_mass_matrix=self.arm_mass_matrix,
+                device=self.device,
+                mass_weighting=True,
+            )
+            self.ctrl_target_joint_pos[:, 7:9] = 0.0
+            self.joint_torque[:, 7:9] = 0.0
+            self._robot.set_joint_position_target(self.ctrl_target_joint_pos)
+            self._robot.set_joint_effort_target(self.joint_torque)
 
     def _apply_force_control(self, force_target, kp_force):
         """z force control: z task wrench = kp * (f_target - f_measured).
@@ -401,6 +422,7 @@ class ContactForceTestEnv(FactoryEnv):
             jacobian=self.fingertip_midpoint_jacobian,
             arm_mass_matrix=self.arm_mass_matrix,
             device=self.device,
+            mass_weighting=self.cfg.ctrl.mass_weighting,
         )
         # Keep the gripper closed (position-controlled), like generate_ctrl_signals.
         self.ctrl_target_joint_pos[:, 7:9] = 0.0

@@ -172,6 +172,7 @@ def make_position_targets(target_pos, target_quat, start_joint_q, exp):
         singularity_damping=0.0,
         partial_inertia_decoupling=False,
         sep_ori=False,
+        mass_weighting=bool(exp.get("mass_weighting", True)),
     )
 
 
@@ -255,6 +256,10 @@ def run_one_push(robot, exp, force, surf_pos, surf_quat, standoff_pos,
             "ft_ee": snap.force_torque.cpu().numpy(),          # real analog of contact sensor
             "est_force_ee_pinv": est_pinv_ee.cpu().numpy(),
             "est_force_ee_dyn": est_dyn_ee.cpu().numpy(),
+            # gravity torque g(q); lets the analysis gravity-remove the est's properly
+            # (replaces the step-0 hack). Zeros if the interface didn't capture it.
+            "gravity": (snap.gravity.cpu().numpy() if snap.gravity is not None
+                        else np.zeros(7, dtype=np.float32)),
         })
 
     robot.end_control()
@@ -323,6 +328,9 @@ def main():
           f"({n_steps} steps @ {rate} Hz)")
     print(f"  gain={exp['gain']}  depths(mm)="
           f"{[round(f / float(exp['gain']) * 1000, 2) for f in forces]}")
+    _mw = bool(exp.get("mass_weighting", True))
+    print(f"  mass_weighting={_mw} "
+          f"({'J^T @ Lambda (inertia-weighted)' if _mw else 'plain J^T (sim-matched)'})")
     print("=" * 70)
 
     robot = FrankaInterface(config, device="cpu")
@@ -410,6 +418,7 @@ def main():
         out["depths"] = np.asarray([f / float(exp["gain"]) for f in forces], dtype=np.float64)
         out["tare_bias"] = np.asarray(all_bias, dtype=np.float64).reshape(len(forces), reps, 6)
         out["meta_gain"] = np.asarray(float(exp["gain"]))
+        out["mass_weighting"] = np.asarray(bool(exp.get("mass_weighting", True)))
         out["prop_gains"] = np.asarray(exp["prop_gains"], dtype=np.float64)
         out["control_rate_hz"] = np.asarray(rate)
         out["hold_seconds"] = np.asarray(float(exp["hold_seconds"]))

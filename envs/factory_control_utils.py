@@ -18,21 +18,38 @@ import math
 import torch
 
 
-def compute_dof_torque_from_wrench(cfg, dof_pos, dof_vel, task_wrench, jacobian, arm_mass_matrix, device):
+def compute_dof_torque_from_wrench(
+    cfg, dof_pos, dof_vel, task_wrench, jacobian, arm_mass_matrix, device, mass_weighting=False
+):
     """Map a task-space (world-frame) wrench to arm joint torques.
 
     ``tau = J^T * wrench`` plus null-space posture control toward the default arm
     configuration; final torques are clamped to ``[-100, 100]``.
+
+    ``mass_weighting`` toggles the task-wrench mapping:
+        False (default): ``tau_task = J^T @ wrench`` (plain J^T, the IsaacLab
+              ``compute_dof_torque`` behavior); realized static EE force = wrench.
+        True: ``tau_task = J^T @ Lambda @ wrench`` with the task-space inertia
+              ``Lambda = (J M^-1 J^T)^-1`` (the real robot's original behavior);
+              realized static EE force = ``Lambda @ wrench``. The null-space
+              posture term always uses the full ``Lambda`` either way.
     """
     num_envs = cfg.scene.num_envs
     dof_torque = torch.zeros((num_envs, dof_pos.shape[1]), device=device)
 
     jacobian_T = torch.transpose(jacobian, dim0=1, dim1=2)
-    dof_torque[:, 0:7] = (jacobian_T @ task_wrench.unsqueeze(-1)).squeeze(-1)
 
-    # Null-space posture control (identical to FactoryEnv).
+    # Task-space inertia Lambda = (J M^-1 J^T)^-1 (needed for the null-space
+    # projector below, and for the wrench mapping when mass_weighting is on).
     arm_mass_matrix_inv = torch.inverse(arm_mass_matrix)
     arm_mass_matrix_task = torch.inverse(jacobian @ arm_mass_matrix_inv @ jacobian_T)
+
+    if mass_weighting:
+        dof_torque[:, 0:7] = (jacobian_T @ (arm_mass_matrix_task @ task_wrench.unsqueeze(-1))).squeeze(-1)
+    else:
+        dof_torque[:, 0:7] = (jacobian_T @ task_wrench.unsqueeze(-1)).squeeze(-1)
+
+    # Null-space posture control (identical to FactoryEnv).
     j_eef_inv = arm_mass_matrix_task @ jacobian @ arm_mass_matrix_inv
     default_dof_pos_tensor = torch.tensor(cfg.ctrl.default_dof_pos_tensor, device=device).repeat((num_envs, 1))
     distance_to_default_dof_pos = default_dof_pos_tensor - dof_pos[:, :7]
