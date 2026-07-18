@@ -50,6 +50,14 @@ def build_parser() -> argparse.ArgumentParser:
              "from the config. Makes runs easy to filter in the wandb UI.",
     )
     parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default=None,
+        help="Override the wandb project for runs created this launch (sets "
+             "experiment.wandb_kwargs['project']). Default: the experiment 'family' "
+             "directory name (i.e. --experiment_directory / experiment.directory).",
+    )
+    parser.add_argument(
         "--logdir",
         type=str,
         default=None,
@@ -507,6 +515,13 @@ def main() -> None:
             if t not in tags:
                 tags.append(t)
         wk["tags"] = tags
+        cfg.experiment.wandb_kwargs = wk
+
+    # --wandb_project: CLI override of the wandb project. make_wandb_run only
+    # setdefault()s project=<family>, so a value in wandb_kwargs wins.
+    if getattr(args, "wandb_project", None):
+        wk = dict(getattr(cfg.experiment, "wandb_kwargs", {}) or {})
+        wk["project"] = args.wandb_project
         cfg.experiment.wandb_kwargs = wk
 
     # Final per-run output dir = <log_root>/<family>/<experiment_name>

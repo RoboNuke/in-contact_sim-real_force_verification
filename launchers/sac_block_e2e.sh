@@ -27,6 +27,7 @@ shift 2
 RUN_EVAL=1
 EXPERIMENT_DIRECTORY=""
 WANDB_TAG_FLAGS=()   # collected --wandb_tag flags, forwarded verbatim to runner.py
+WANDB_PROJECT_FLAG=()   # --wandb_project flag, forwarded verbatim to runner.py
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no_eval) RUN_EVAL=0 ;;
@@ -36,6 +37,9 @@ while [[ $# -gt 0 ]]; do
         --wandb_tag)
             [[ $# -ge 2 ]] || { echo "[launcher] --wandb_tag requires a value" >&2; exit 2; }
             WANDB_TAG_FLAGS+=("--wandb_tag" "$2"); shift ;;
+        --wandb_project)
+            [[ $# -ge 2 ]] || { echo "[launcher] --wandb_project requires a value" >&2; exit 2; }
+            WANDB_PROJECT_FLAG=(--wandb_project "$2"); shift ;;
         *) echo "[launcher] unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -120,6 +124,7 @@ TRAIN_RC=0
     --logdir "$LOGDIR" \
     "${EXP_DIR_FLAG[@]}" \
     "${WANDB_TAG_FLAGS[@]}" \
+    "${WANDB_PROJECT_FLAG[@]}" \
     --mode train \
     --headless || TRAIN_RC=$?
 
@@ -162,6 +167,7 @@ if [[ "$RUN_EVAL" -eq 1 ]]; then
         --logdir "$LOGDIR" \
         "${EXP_DIR_FLAG[@]}" \
         "${WANDB_TAG_FLAGS[@]}" \
+        "${WANDB_PROJECT_FLAG[@]}" \
         --checkpoint "$EXP_DIR" \
         --mode eval \
         --headless
