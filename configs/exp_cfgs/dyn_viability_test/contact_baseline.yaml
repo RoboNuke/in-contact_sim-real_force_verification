@@ -17,6 +17,7 @@ runner_cfg:
     task.contact_penalty_threshold_range: [2.5, 7.5]
 
 sac_cfg:
+  tensorboard: false                # wandb-only: no TensorBoard scalar writer (avoids skrl's sync_tensorboard run)
   gradient_steps: 8
   batch_size: 1024
   discount_factor: 0.99

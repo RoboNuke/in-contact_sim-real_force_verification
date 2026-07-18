@@ -455,7 +455,20 @@ class SAC(Agent):
         """
         if getattr(self, "_init_done", False):
             return
-        super().init(trainer_cfg=trainer_cfg)
+        # skrl's base Agent.init() fires its OWN single shared wandb.init() (with
+        # sync_tensorboard=True) for the shared writer we discard below — that stray
+        # run then slurps every per-agent TensorBoard event into one run ("each agent
+        # a metric family"). We publish a per-agent wandb run ourselves, so hide
+        # experiment.wandb across the base init and restore it afterward.
+        _exp = getattr(self.cfg, "experiment", None)
+        _wandb_flag = bool(getattr(_exp, "wandb", False)) if _exp is not None else False
+        if _wandb_flag:
+            _exp.wandb = False
+        try:
+            super().init(trainer_cfg=trainer_cfg)
+        finally:
+            if _wandb_flag:
+                _exp.wandb = True
         self.enable_models_training_mode(False)
 
         # tear down the shared writer the base class created (we publish per-agent only).
@@ -521,11 +534,14 @@ class SAC(Agent):
                     )
                 else:
                     self.per_agent_writers.append(tb_writer)
-                # Image writer (torch SummaryWriter) — same log dir so TB
-                # aggregates scalar + image events under the same agent run.
-                self.per_agent_image_writers.append(
-                    TorchSummaryWriter(log_dir=agent_log_dir)
-                )
+                # Image writer (torch SummaryWriter) for diagnostic heatmaps/images.
+                # These are TB-only (never mirrored to wandb), so honor tensorboard=false
+                # by not creating them at all — otherwise tfevents keep being written even
+                # in wandb-only mode. Consumers guard on this list being non-empty.
+                if tb_enabled:
+                    self.per_agent_image_writers.append(
+                        TorchSummaryWriter(log_dir=agent_log_dir)
+                    )
                 self.per_agent_tracking.append(collections.defaultdict(list))
                 self._per_agent_track_rewards.append([])
                 self._per_agent_track_timesteps.append([])
@@ -600,7 +616,7 @@ class SAC(Agent):
         # BCE, monotonicity) and emit per-class heatmap PNGs to TB. Done
         # BEFORE the scalar flush below so the new scalars land in this
         # interval's write. Tracker also clears its own per-interval buffer.
-        if self._pred_quality_tracker is not None:
+        if self._pred_quality_tracker is not None and self.per_agent_image_writers:
             self._pred_quality_tracker.flush_per_agent(
                 per_agent_tracking=self.per_agent_tracking,
                 per_agent_writers=self.per_agent_image_writers,
@@ -611,7 +627,7 @@ class SAC(Agent):
         # per_agent_tracking (consumed by the scalar flush loop below);
         # histograms / images written directly. Only runs once attach_rescue
         # has been called.
-        if self._rescue_enabled and self._rescue_metrics is not None:
+        if self._rescue_enabled and self._rescue_metrics is not None and self.per_agent_image_writers:
             self._rescue_metrics.flush_per_agent(
                 per_agent_tracking=self.per_agent_tracking,
                 per_agent_writers=self.per_agent_image_writers,
@@ -697,6 +713,12 @@ class SAC(Agent):
                 vel_list.clear()
 
             self.per_agent_tracking[i].clear()
+
+            # Commit this interval. A skrl SummaryWriter (TB) writes each add_scalar
+            # immediately, but a MetricWriter BUFFERS wandb scalars and only emits a
+            # single run.log() on flush() — without this per-interval flush every
+            # interval collapses into one final row at close(). Harmless for TB.
+            writer.flush()
 
     # --------------------------------------------------------------
     # Interaction
