@@ -224,6 +224,22 @@ class SAC(Agent):
         # One-shot stdout warning when info[success_info_key] is absent.
         self._warned_no_success_key: bool = False
 
+        # Force / contact / break metrics. Per-agent accumulators over the current
+        # write_interval, filled from info["contact_force"] (world frame, N) and
+        # info["peg_broke"] in record_transition, emitted + reset in write_tracking_data.
+        # Allocated lazily on first sighting (device from the data). All None until then,
+        # so tasks that never publish contact_force simply log nothing.
+        self._contact_force_eps: float = float(getattr(self.cfg, "contact_force_eps", 1.0))
+        self._fm_count: torch.Tensor | None = None      # (A,)   env*steps this interval
+        self._fm_sum: torch.Tensor | None = None        # (A,)   sum |F|
+        self._fm_sumsq: torch.Tensor | None = None      # (A,)   sum |F|^2 (for std)
+        self._fm_max: torch.Tensor | None = None        # (A,)   max |F|
+        self._fm_axis_sum: torch.Tensor | None = None   # (A, 3) sum of signed F per axis
+        self._fm_contact_any: torch.Tensor | None = None    # (A,)   count |F| > eps
+        self._fm_contact_axis: torch.Tensor | None = None   # (A, 3) count |F_axis| > eps
+        self._fm_breaks: torch.Tensor | None = None     # (A,)   sum peg_broke
+        self._fm_finishes: torch.Tensor | None = None   # (A,)   sum episode-ends
+
         # Success-prediction config (read once into instance attrs for fast access).
         self.predict_success: bool = bool(getattr(self.cfg, "predict_success", False))
         self.success_td_weight: float = float(getattr(self.cfg, "success_td_weight", 0.0))
@@ -328,6 +344,81 @@ class SAC(Agent):
         for i in range(self.num_agents):
             v = values_per_agent[i]
             self.per_agent_tracking[i][tag].append(v.item() if torch.is_tensor(v) else float(v))
+
+    def _accumulate_force_metrics(self, infos, terminated, truncated, total_envs, epa) -> None:
+        """Accumulate per-agent force/contact/break stats over the current interval.
+
+        Reads ``info["contact_force"]`` ((total_envs, 3), world frame N) and
+        ``info["peg_broke"]`` ((total_envs,)). No-ops when they are absent or the
+        env count doesn't factor evenly across agents. Emitted + reset in
+        write_tracking_data.
+        """
+        if not isinstance(infos, dict) or epa * self.num_agents != total_envs:
+            return
+        cf = infos.get("contact_force", None)
+        if torch.is_tensor(cf) and cf.shape[0] == total_envs and cf.shape[-1] == 3:
+            f = cf.view(self.num_agents, epa, 3).float()        # (A, epa, 3)
+            mag = torch.linalg.norm(f, dim=-1)                  # (A, epa)
+            eps = self._contact_force_eps
+            if self._fm_count is None:
+                dev = f.device
+                z = lambda *s: torch.zeros(*s, device=dev)      # noqa: E731
+                self._fm_count, self._fm_sum, self._fm_sumsq, self._fm_max = z(self.num_agents), z(self.num_agents), z(self.num_agents), z(self.num_agents)
+                self._fm_axis_sum = z(self.num_agents, 3)
+                self._fm_contact_any = z(self.num_agents)
+                self._fm_contact_axis = z(self.num_agents, 3)
+                self._fm_breaks, self._fm_finishes = z(self.num_agents), z(self.num_agents)
+            self._fm_count += epa
+            self._fm_sum += mag.sum(dim=1)
+            self._fm_sumsq += (mag * mag).sum(dim=1)
+            self._fm_max = torch.maximum(self._fm_max, mag.amax(dim=1))
+            self._fm_axis_sum += f.sum(dim=1)
+            self._fm_contact_any += (mag > eps).sum(dim=1).float()
+            self._fm_contact_axis += (f.abs() > eps).sum(dim=1).float()
+            # Break rate over episodes that FINISHED this interval (breaks / finishes).
+            pb = infos.get("peg_broke", None)
+            if torch.is_tensor(pb) and pb.shape[0] == total_envs:
+                self._fm_breaks += pb.view(self.num_agents, epa).float().sum(dim=1)
+                done = (terminated + truncated).bool().view(self.num_agents, epa)
+                self._fm_finishes += done.float().sum(dim=1)
+
+    def _emit_force_metrics(self, i: int, writer, timestep: int) -> None:
+        """Emit + is not responsible for reset (done once after the per-agent loop).
+
+        All metrics are over this interval's (env x step) samples for agent ``i``,
+        world frame. Skips silently when no contact_force was seen.
+        """
+        if self._fm_count is None or float(self._fm_count[i]) <= 0:
+            return
+        c = self._fm_count[i]
+        mean = self._fm_sum[i] / c
+        var = torch.clamp(self._fm_sumsq[i] / c - mean * mean, min=0.0)
+        axis = self._fm_axis_sum[i] / c
+        cany = 100.0 * self._fm_contact_any[i] / c
+        cax = 100.0 * self._fm_contact_axis[i] / c
+        writer.add_scalar(tag="Force / magnitude (mean)", value=float(mean), timestep=timestep)
+        writer.add_scalar(tag="Force / magnitude (max)", value=float(self._fm_max[i]), timestep=timestep)
+        writer.add_scalar(tag="Force / magnitude (std)", value=float(torch.sqrt(var)), timestep=timestep)
+        writer.add_scalar(tag="Force / mean x", value=float(axis[0]), timestep=timestep)
+        writer.add_scalar(tag="Force / mean y", value=float(axis[1]), timestep=timestep)
+        writer.add_scalar(tag="Force / mean z", value=float(axis[2]), timestep=timestep)
+        writer.add_scalar(tag="Contact / any (%)", value=float(cany), timestep=timestep)
+        writer.add_scalar(tag="Contact / x (%)", value=float(cax[0]), timestep=timestep)
+        writer.add_scalar(tag="Contact / y (%)", value=float(cax[1]), timestep=timestep)
+        writer.add_scalar(tag="Contact / z (%)", value=float(cax[2]), timestep=timestep)
+        if float(self._fm_finishes[i]) > 0:
+            writer.add_scalar(tag="Break / rate (%)",
+                              value=float(100.0 * self._fm_breaks[i] / self._fm_finishes[i]),
+                              timestep=timestep)
+
+    def _reset_force_metrics(self) -> None:
+        """Zero all force accumulators for the next interval (no-op if never allocated)."""
+        if self._fm_count is None:
+            return
+        for t in (self._fm_count, self._fm_sum, self._fm_sumsq, self._fm_max,
+                  self._fm_axis_sum, self._fm_contact_any, self._fm_contact_axis,
+                  self._fm_breaks, self._fm_finishes):
+            t.zero_()
 
     # --------------------------------------------------------------
     # Rescue-buffer attachment
@@ -714,11 +805,17 @@ class SAC(Agent):
 
             self.per_agent_tracking[i].clear()
 
+            # Force / contact / break metrics for this agent (from the interval accumulators).
+            self._emit_force_metrics(i, writer, timestep)
+
             # Commit this interval. A skrl SummaryWriter (TB) writes each add_scalar
             # immediately, but a MetricWriter BUFFERS wandb scalars and only emits a
             # single run.log() on flush() — without this per-interval flush every
             # interval collapses into one final row at close(). Harmless for TB.
             writer.flush()
+
+        # Reset the force accumulators once, after every agent has emitted this interval.
+        self._reset_force_metrics()
 
     # --------------------------------------------------------------
     # Interaction
@@ -793,6 +890,11 @@ class SAC(Agent):
                                  rewards_per_agent.amin(dim=(1, 2)))
             self.track_per_agent("Reward / Instantaneous reward (mean)",
                                  rewards_per_agent.mean(dim=(1, 2)))
+
+            # Force / contact / break metrics (world frame). Accumulate per agent from
+            # info["contact_force"] and info["peg_broke"]; emitted + reset in
+            # write_tracking_data. Absent keys => this task doesn't publish them.
+            self._accumulate_force_metrics(infos, terminated, truncated, total_envs, epa)
 
             # Per-env episode finishes; partition by agent index. Stats over the
             # accumulated episodes (max/min/mean) are emitted in write_tracking_data

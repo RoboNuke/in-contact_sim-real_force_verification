@@ -69,6 +69,12 @@ class SAC_CFG(AgentCfg):
     — if both this and wandb are off, TensorBoard is kept on so logging isn't silently lost.
     (Sibling of ``experiment`` because skrl's ``ExperimentCfg`` has no such field.)"""
 
+    contact_force_eps: float = 1.0
+    """Force magnitude (N) above which a step counts as "in contact" for the
+    ``Contact / *`` percentage metrics (per-axis uses ``|F_axis| > eps``). Only used
+    for logging when ``info["contact_force"]`` is present (FORGE + breakable peg).
+    Set above the no-contact noise/held-weight floor so light noise isn't counted."""
+
     gradient_steps: int = 1
     """Number of gradient steps to perform for each update."""
 

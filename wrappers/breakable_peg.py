@@ -286,4 +286,10 @@ class BreakablePegWrapper(gym.Wrapper):
         if isinstance(info, dict):
             info["peg_broke"] = self._broke.clone()
             info["peg_broke_rate"] = self._broke.float().mean()
+            # Publish the world-frame contact force (the exact FORGE signal used for
+            # break detection, ||force_sensor_smooth[:, :3]||) so the agent can log
+            # force/contact metrics. (num_envs, 3); absent if the attr isn't present.
+            fs = getattr(self._u, "force_sensor_smooth", None)
+            if fs is not None:
+                info["contact_force"] = fs[:, 0:3].clone()
         return obs, reward, terminated, truncated, info
