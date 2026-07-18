@@ -22,6 +22,8 @@ from skrl.models.torch import Model
 from skrl.utils import ScopedTimer
 from skrl.utils.tensorboard import SummaryWriter
 
+from learning.metric_writer import MetricWriter, make_wandb_run
+
 from configs.manager.preprocessor_registry import resolve_preprocessor
 from configs.manager.sac_cfg import SAC_CFG
 from models.block_simba import (
@@ -485,13 +487,40 @@ class SAC(Agent):
         # per-agent writers + per-agent reward/episode deques.
         # Layout: <experiment_dir>/<i>/ holds tensorboard events AND checkpoints for agent i,
         # so each agent's folder is fully self-contained.
+        # Backend is the single experiment.wandb bool (skrl's ExperimentCfg): when set,
+        # each agent's SummaryWriter is wrapped in a MetricWriter that mirrors the same
+        # scalars to that agent's own wandb run (write_tracking_data is unchanged — it
+        # only calls add_scalar/flush, which the wrapper forwards to both backends).
+        wandb_enabled = bool(getattr(getattr(self.cfg, "experiment", None), "wandb", False))
+        # SAC_CFG.tensorboard (sibling of experiment): False => log only to wandb. MetricWriter
+        # already no-ops every TB call when its tb_writer is None, so we just pass None.
+        tb_enabled = bool(getattr(self.cfg, "tensorboard", True))
+        if not tb_enabled and not wandb_enabled:
+            print("[sac] tensorboard=false but experiment.wandb is off — keeping "
+                  "TensorBoard so scalars aren't silently lost.", flush=True)
+            tb_enabled = True
         if self.write_interval > 0:
             from torch.utils.tensorboard import SummaryWriter as TorchSummaryWriter
             for i in range(self.num_agents):
                 agent_log_dir = os.path.join(self.experiment_dir, str(i))
-                self.per_agent_writers.append(
-                    SummaryWriter(log_dir=agent_log_dir)
-                )
+                os.makedirs(agent_log_dir, exist_ok=True)  # SummaryWriter normally makes this; ensure it exists when TB is off
+                tb_writer = SummaryWriter(log_dir=agent_log_dir) if tb_enabled else None
+                if wandb_enabled:
+                    wandb_run = make_wandb_run(
+                        agent_index=i,
+                        num_agents=self.num_agents,
+                        experiment_dir=self.experiment_dir,
+                        log_dir=agent_log_dir,
+                        cfg=self.cfg,
+                    )
+                    # The runner dumps the verbatim runtime config to this path
+                    # AFTER init(); MetricWriter.close() attaches it to the run.
+                    cfg_path = os.path.join(agent_log_dir, "config.yaml")
+                    self.per_agent_writers.append(
+                        MetricWriter(tb_writer, wandb_run, config_path=cfg_path)
+                    )
+                else:
+                    self.per_agent_writers.append(tb_writer)
                 # Image writer (torch SummaryWriter) — same log dir so TB
                 # aggregates scalar + image events under the same agent run.
                 self.per_agent_image_writers.append(

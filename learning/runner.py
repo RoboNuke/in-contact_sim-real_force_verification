@@ -33,6 +33,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Overrides sac_cfg.experiment.experiment_name from --config.",
     )
     parser.add_argument(
+        "--experiment_directory",
+        type=str,
+        default=None,
+        help="Overrides sac_cfg.experiment.directory from --config (the 'family' "
+             "subdir under --logdir). Lets you save runs to different places "
+             "without editing the YAML.",
+    )
+    parser.add_argument(
+        "--wandb_tag",
+        type=str,
+        action="append",
+        default=None,
+        help="Append a tag to every wandb run created this launch (repeatable: "
+             "--wandb_tag a --wandb_tag b). Merged with any experiment.wandb_kwargs.tags "
+             "from the config. Makes runs easy to filter in the wandb UI.",
+    )
+    parser.add_argument(
         "--logdir",
         type=str,
         default=None,
@@ -173,6 +190,8 @@ def main() -> None:
     sac_cfg = loaded["sac_cfg"]
     model_cfg = loaded["model_cfg"]
     rescue_buffer_cfg = loaded["rescue_buffer_cfg"]
+    force_obs_cfg = loaded["force_obs_cfg"]
+    breakable_peg_cfg = loaded["breakable_peg_cfg"]
 
     # CLI > YAML for runner-level fields. Apply overrides to the loaded RunnerCfg so
     # the dump-config-to-disk step at the end records the values actually used.
@@ -306,6 +325,35 @@ def main() -> None:
         )
 
     env = gym.make(runner_cfg.task, cfg=env_cfg, render_mode=None)
+    # Optional FORGE force-observation wrapper (force-source injection + force
+    # history). Applied to the RAW gym env, BELOW the skrl wrapper: it mutates the
+    # base env's obs/state spaces and hooks in place, so skrl's IsaacLabWrapper
+    # (which reads env.unwrapped.single_observation_space) picks up the new sizes.
+    if force_obs_cfg.enabled:
+        from wrappers.force_obs_wrapper import ForceObsWrapper
+
+        env = ForceObsWrapper(env, force_obs_cfg)
+        print(
+            f"[runner] ForceObsWrapper: source={force_obs_cfg.force_source} "
+            f"history_enabled={force_obs_cfg.history_enabled} "
+            f"history_length={force_obs_cfg.history_length}"
+        )
+    # Optional breakable-peg mechanics (stock FORGE tasks only). Terminates an env
+    # when its smoothed contact-force magnitude exceeds break_force and resets just
+    # that env efficiently — no full-batch re-grasp. Applied to the RAW gym env
+    # BELOW the skrl wrapper (like ForceObsWrapper): it monkeypatches the base
+    # env's _get_dones/_get_rewards/_reset_idx, so it must sit under the skrl
+    # wrapper for those hooks to fire inside DirectRLEnv.step().
+    if breakable_peg_cfg.enabled:
+        from wrappers.breakable_peg import BreakablePegWrapper
+
+        env = BreakablePegWrapper(env, breakable_peg_cfg)
+        print(
+            f"[runner] BreakablePegWrapper: break_force="
+            f"{breakable_peg_cfg.break_force} N  "
+            f"peg_break_rew={breakable_peg_cfg.peg_break_rew}  "
+            f"force_margin={breakable_peg_cfg.force_margin} N"
+        )
     # Always wrap with a subclass of skrl's IsaacLabWrapper. When no task-specific
     # wrapper was selected, fall back to RewardDecompositionWrapper so every
     # manager-based task gets per-env per-term reward logging in per-episode units
@@ -444,6 +492,22 @@ def main() -> None:
     # CLI > YAML > auto-generated for the run name.
     exp_name = args.experiment_name or cfg.experiment.experiment_name or f"{runner_cfg.task}_sac_N{n_agents}"
     cfg.experiment.experiment_name = exp_name
+
+    # --experiment_directory: CLI override of the experiment "family" subdir. Applied
+    # before the final-directory computation below so it redirects runs without a YAML edit.
+    if args.experiment_directory is not None:
+        cfg.experiment.directory = args.experiment_directory
+
+    # --wandb_tag: APPEND to experiment.wandb_kwargs["tags"] (deduped, order preserved) so
+    # make_wandb_run passes them straight to wandb.init(tags=...). Merges with any config tags.
+    if getattr(args, "wandb_tag", None):
+        wk = dict(getattr(cfg.experiment, "wandb_kwargs", {}) or {})
+        tags = list(wk.get("tags") or [])
+        for t in args.wandb_tag:
+            if t not in tags:
+                tags.append(t)
+        wk["tags"] = tags
+        cfg.experiment.wandb_kwargs = wk
 
     # Final per-run output dir = <log_root>/<family>/<experiment_name>
     #   * log_root: --logdir CLI (e.g. "runs/", or absolute), default "runs/".
@@ -651,6 +715,22 @@ def main() -> None:
             env.close()
         except Exception as e:
             print(f"[runner] env.close() raised: {e!r}", flush=True)
+
+        # Flush + close every per-agent writer synchronously. The exit paths below use
+        # os._exit(), which skips Python/atexit cleanup — so the writers' background
+        # threads never run. Flush here or lose the final interval's scalars and, for a
+        # MetricWriter, the wandb run is never finished/synced (close() calls run.finish()).
+        for _w in (getattr(agent, "per_agent_writers", None) or []):
+            try:
+                _w.flush(); _w.close()
+            except Exception as e:
+                print(f"[runner] per-agent writer flush/close raised: {e!r}", flush=True)
+        for _w in (getattr(agent, "per_agent_image_writers", None) or []):
+            try:
+                _w.flush(); _w.close()
+            except Exception as e:
+                print(f"[runner] per-agent image writer flush/close raised: {e!r}", flush=True)
+
         # If training raised, exit non-zero NOW — Isaac's simulation_app.close()
         # internally calls os._exit(0) on shutdown, which would otherwise mask
         # our exception and report rc=0 to the launcher.

@@ -100,3 +100,15 @@ rescue_buffer_cfg:
   projection_recompute_threshold: 50
   projection_n_neighbors: 15
   projection_min_dist: 0.1
+
+breakable_peg_cfg:                  # break the peg past a contact-force threshold (see BreakablePegCfg)
+  enabled: false                    # master toggle; non-FORGE tasks leave this false
+  break_force: 25.0                 # N; must exceed max(contact_penalty_threshold_range) + force_margin
+  peg_break_rew: -10.0              # reward added on the breaking step (failure penalty)
+  force_margin: 1.0                 # required N gap above FORGE's contact-penalty threshold (validated at init)
+
+force_obs_cfg:                      # FORGE force-observation wrapper (see ForceObsCfg)
+  enabled: false                    # master toggle; non-FORGE tasks leave this false
+  force_source: contact             # "contact" (FORGE sensor) | "dyn_pinv" (J-inv from joint torques, no EMA)
+  history_enabled: false            # append last N force vectors to policy+critic obs
+  history_length: 0                 # N (obs grows by N*3 when history_enabled)

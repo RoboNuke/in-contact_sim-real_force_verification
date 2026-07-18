@@ -1,70 +1,80 @@
-# Factory Gear Mesh (IndustReal-style env). Direct-API task with asymmetric AC.
-# action_space=6 (all continuous). obs=21, state=72. Episode: 20s @ 15Hz = 300 steps.
-#
-# Success prediction via pipeline's BCE head (TrajectoryBufferedMemory auto-selected).
-# Every registered ConfigManager header must appear; unknown keys are hard errors.
+# dyn_viability_test — Forge Peg Insertion, breakable peg, BASE FORGE force obs (no history).
+# Copied from forge_peg_insert_baseline.yaml; only the dyn_viability_test parameters changed:
+#   runner_cfg.num_agents 2->5, env_cfg_overrides.task.contact_penalty_threshold_range=[2.5,7.5],
+#   sac_cfg.learning_starts 1500->450, breakable_peg_cfg (on, 10 N),
+#   force_obs_cfg (disabled => stock FORGE contact ft_force).
+# This config: force observation = stock FORGE contact-sensor reading.
 
 runner_cfg:
-  task: Isaac-Factory-GearMesh-Direct-v0
-  num_envs: 256
-  num_agents: 1
-  total_timesteps: 100_000          # env.step() calls; transitions = total_timesteps * num_envs * num_agents
-  eval_timesteps: 300               # env.step() calls (~1 GearMesh episode)
+  task: Isaac-Forge-PegInsert-Direct-v0
+  num_envs: 256                     # Forge default scene num_envs is 128; can scale up
+  num_agents: 5
+  total_timesteps: 20_000           # env.step() calls; transitions = total_timesteps * num_envs * num_agents
+  eval_timesteps: 150               # env.step() calls (~1 PegInsert episode at 150 steps)
   memory_size: 2_000_000            # replay buffer capacity PER AGENT
   seed: -1                          # -1 = non-deterministic
+  env_cfg_overrides:                # narrow FORGE's per-episode contact-penalty threshold range
+    task.contact_penalty_threshold_range: [2.5, 7.5]
 
 sac_cfg:
   gradient_steps: 8
-  batch_size: 1024                  # per agent
+  batch_size: 1024
   discount_factor: 0.99
   polyak: 0.005
   actor_lr: 1.0e-4                  # AdamW
   critic_lr: 1.0e-4                 # AdamW
-  entropy_lr: 1.0e-4                # AdamW
+  entropy_lr: 1.0e-4                # AdamW (weight_decay always 0 for entropy)
   weight_decay: 1.0e-2              # decoupled weight decay applied to actor + critic
   random_timesteps: 0
-  learning_starts: 300              # >= max_episode_length so every env finalizes
-                                    # at least one trajectory before SAC.update()
-                                    # fires (TrajectoryBufferedMemory requirement)
+  learning_starts: 450
   learn_entropy: true
   initial_entropy_value: 1.0e-2
-  target_entropy: -3                # -|num_continuous|/2 (= -3 for 6-dim continuous)
+  target_entropy: -2.5 # x,y,z,yaw, success (5/2=2.5)
   grad_norm_clip: 0.0
   mixed_precision: false
   observation_preprocessor: RunningStandardScaler
   observation_preprocessor_kwargs: {}
   rewards_shaper_scale: null
-  gripper_action_idx: null          # no gripper on Factory tasks
-  predict_success: true             # use pipeline's BCE success head
-  success_td_weight: 1.0            # weight on the success-head TD loss
-  success_td_discount: 0.995        # γ for the discounted-success target;
-                                    # ≈1 − 1/L → "P(success within ~300 steps)"
+  gripper_action_idx: null          # no gripper on Forge tasks
+  predict_success: true            # Forge handles success internally via the action space
+  ################################################
+  # These settings make our code match the FORGE paper
+  # Setting to zero means it will not effect training (using only forge reward)
+  success_td_weight: 0.0
+  # set to 1, means that successful trajectories have every step set to 1 in buffer
+  success_td_discount: 1.0
+  # start training immediantly
+  success_train_min_successes: 0
+  #################################################
   success_info_key: is_success
   success_heatmap_step_bins: 30    # vertical bins on success/fail P-mean heatmaps;
                                     # set to max_episode_length for one row per step
-  success_wrapper: null             # auto-detect "factory" wrapper from task prefix
+  success_wrapper: null             # auto-detect "forge" wrapper from task prefix
   recorder:
     enabled: false                  # TiledCamera unusable on this IsaacSim/driver/GPU combo;
                                     # see configs/exp_cfgs/default.yaml for the full block.
   experiment:
-    directory: runs
-    experiment_name: ""
-    write_interval: 300             # one episode per write
+    directory: forge_pih
+    experiment_name: ""             # empty => runner auto-generates as <task>_sac_N<num_agents>
+    write_interval: 150             # one episode per write
     checkpoint_interval: auto
+    wandb: true                   # one wandb run per agent; group=<config stem>, project=<experiment.directory>
+    wandb_kwargs:
+      entity: hur                 # wandb entity (from RoboNuke reference configs)
 
 model_cfg:
   actor:
     act_init_std: 1.0
     actor_n: 1
     actor_latent: 128
-    last_layer_scale: 0.1
+    last_layer_scale: 0.1           # tiny init → small initial actions, less tanh saturation
     clip_log_std: true
     min_log_std: -20.0
     max_log_std: 2.0
     reduction: sum
     use_state_dependent_std: false
-    bernoulli_action_dims: null
-    force_zero_action_dims: null    # Factory uses all 6 action dims
+    bernoulli_action_dims: null     # all-continuous (no binary gripper)
+    force_zero_action_dims: [3, 4]  # Forge sets actions[:, 3:5] = 0 internally
   critic:
     critic_output_init_mean: 0.0
     critic_n: 2
@@ -84,7 +94,7 @@ rescue_buffer_cfg:
   dead_point_min_attempts: 3
   action_entropy_first_k_steps: 10
   # ---- Metric publication ----
-  metric_compute_interval: 300     # must equal sac_cfg.experiment.write_interval
+  metric_compute_interval: 150     # must equal sac_cfg.experiment.write_interval
   buffer_snapshot_interval: 50000
   snapshot_dir: rescue_snapshots
   # ---- Section 5 — diversity / clustering ----
@@ -101,13 +111,13 @@ rescue_buffer_cfg:
   projection_min_dist: 0.1
 
 breakable_peg_cfg:                  # break the peg past a contact-force threshold (see BreakablePegCfg)
-  enabled: false                    # master toggle; non-FORGE tasks leave this false
-  break_force: 25.0                 # N; must exceed max(contact_penalty_threshold_range) + force_margin
+  enabled: true                     # all dyn_viability_test configs run with a breakable peg
+  break_force: 10.0                 # N; must exceed max(contact_penalty_threshold_range)=7.5 + force_margin
   peg_break_rew: -10.0              # reward added on the breaking step (failure penalty)
   force_margin: 1.0                 # required N gap above FORGE's contact-penalty threshold (validated at init)
 
 force_obs_cfg:                      # FORGE force-observation wrapper (see ForceObsCfg)
-  enabled: false                    # master toggle; non-FORGE tasks leave this false
-  force_source: contact             # "contact" (FORGE sensor) | "dyn_pinv" (J-inv from joint torques, no EMA)
-  history_enabled: false            # append last N force vectors to policy+critic obs
-  history_length: 0                 # N (obs grows by N*3 when history_enabled)
+  enabled: false                    # disabled => stock FORGE contact ft_force (base forge env)
+  force_source: contact             # (unused while disabled)
+  history_enabled: false            # no force history in this config
+  history_length: 0

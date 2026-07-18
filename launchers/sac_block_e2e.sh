@@ -17,7 +17,7 @@ trap 'echo "[launcher] FAILED at ${BASH_SOURCE[0]}:${LINENO} (exit $?)" >&2' ERR
 
 # ===== Args =====
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <config_path> <experiment_name> [--no_eval]" >&2
+    echo "Usage: $0 <config_path> <experiment_name> [--no_eval] [--experiment_directory <dir>] [--wandb_tag <tag> ...]" >&2
     echo "  e.g. $0 configs/exp_cfgs/cartpole.yaml cartpole_run1" >&2
     exit 2
 fi
@@ -25,9 +25,17 @@ CONFIG_PATH="$1"
 EXPERIMENT_NAME="$2"
 shift 2
 RUN_EVAL=1
+EXPERIMENT_DIRECTORY=""
+WANDB_TAG_FLAGS=()   # collected --wandb_tag flags, forwarded verbatim to runner.py
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no_eval) RUN_EVAL=0 ;;
+        --experiment_directory)
+            [[ $# -ge 2 ]] || { echo "[launcher] --experiment_directory requires a value" >&2; exit 2; }
+            EXPERIMENT_DIRECTORY="$2"; shift ;;
+        --wandb_tag)
+            [[ $# -ge 2 ]] || { echo "[launcher] --wandb_tag requires a value" >&2; exit 2; }
+            WANDB_TAG_FLAGS+=("--wandb_tag" "$2"); shift ;;
         *) echo "[launcher] unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -42,8 +50,10 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 LOGDIR="${LOGDIR:-$PROJECT_ROOT/runs}"
 
 RUNNER="$PROJECT_ROOT/learning/runner.py"
-EXP_DIR="$LOGDIR/$EXPERIMENT_NAME"
-EVAL_EXP_NAME="${EXPERIMENT_NAME}_eval"
+# Final per-run output dir mirrors runner.py: <logdir>/<family>/<experiment_name>.
+# EXP_DIR / EVAL_EXP_NAME are computed below — AFTER the config's
+# sac_cfg.experiment.directory is read — so the checkpoint/eval paths match
+# runner.py's output dir even when --experiment_directory was not passed.
 
 # Resolve config to absolute (allow caller to pass a project-root-relative path).
 if [[ "$CONFIG_PATH" != /* ]]; then
@@ -70,6 +80,31 @@ NUM_AGENTS="$("$PYTHON" -c "import yaml,sys; print(yaml.safe_load(open('$CONFIG_
 [[ "$NUM_AGENTS" =~ ^[0-9]+$ ]] \
     || { echo "[launcher] could not read runner_cfg.num_agents from $CONFIG_PATH (got '$NUM_AGENTS')" >&2; exit 1; }
 
+# ===== Resolve the output dir EXACTLY like runner.py (<logdir>/<family>/<exp_name>) =====
+# Family subdir: --experiment_directory wins; otherwise fall back to the config's own
+# sac_cfg.experiment.directory (what runner.py uses). Without this, a caller that omits
+# --experiment_directory would look in <logdir>/<exp_name> while runner.py wrote to
+# <logdir>/<family>/<exp_name>. We use a SEPARATE var (FAMILY) so this fallback does NOT
+# change what is forwarded to runner.py via EXP_DIR_FLAG below. The runner's legacy collapse
+# (family basename == logdir basename => drop the family level) is replicated here.
+FAMILY="$EXPERIMENT_DIRECTORY"
+if [[ -z "$FAMILY" ]]; then
+    FAMILY="$("$PYTHON" -c "import yaml; c=yaml.safe_load(open('$CONFIG_PATH')) or {}; e=(c.get('sac_cfg') or {}).get('experiment') or {}; print(e.get('directory') or '')" 2>/dev/null || true)"
+fi
+EXP_FAMILY_DIR="$LOGDIR"
+if [[ -n "$FAMILY" && "$(basename "$FAMILY")" != "$(basename "$LOGDIR")" ]]; then
+    EXP_FAMILY_DIR="$LOGDIR/$FAMILY"
+fi
+EXP_DIR="$EXP_FAMILY_DIR/$EXPERIMENT_NAME"
+EVAL_EXP_NAME="${EXPERIMENT_NAME}_eval"
+
+# Optional --experiment_directory passthrough: only forward the flag when the caller set
+# it, so an empty value falls back to the YAML's experiment.directory.
+EXP_DIR_FLAG=()
+if [[ -n "$EXPERIMENT_DIRECTORY" ]]; then
+    EXP_DIR_FLAG=(--experiment_directory "$EXPERIMENT_DIRECTORY")
+fi
+
 echo "[launcher] python=$(command -v "$PYTHON")  config=$CONFIG_PATH  experiment=$EXPERIMENT_NAME  num_agents=$NUM_AGENTS"
 
 # ===== Train =====
@@ -83,6 +118,8 @@ TRAIN_RC=0
     --config "$CONFIG_PATH" \
     --experiment_name "$EXPERIMENT_NAME" \
     --logdir "$LOGDIR" \
+    "${EXP_DIR_FLAG[@]}" \
+    "${WANDB_TAG_FLAGS[@]}" \
     --mode train \
     --headless || TRAIN_RC=$?
 
@@ -123,6 +160,8 @@ if [[ "$RUN_EVAL" -eq 1 ]]; then
         --config "$CONFIG_PATH" \
         --experiment_name "$EVAL_EXP_NAME" \
         --logdir "$LOGDIR" \
+        "${EXP_DIR_FLAG[@]}" \
+        "${WANDB_TAG_FLAGS[@]}" \
         --checkpoint "$EXP_DIR" \
         --mode eval \
         --headless

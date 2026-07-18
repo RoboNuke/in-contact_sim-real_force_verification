@@ -10,6 +10,23 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+# ---------------------------------------------------------------------------
+# Force-observation wrapper (FORGE only).
+#
+# NOTE: this is NOT a ``_REGISTRY`` entry. Registry wrappers are skrl
+# ``IsaacLabWrapper`` subclasses that become the *top-level* training env.
+# ``ForceObsWrapper`` is a lower-level gymnasium wrapper that mutates the raw
+# FORGE env in place and must be applied BELOW the skrl wrapper. The runner
+# applies it directly (gated on ``force_obs_cfg.enabled``); import the
+# class/cfg from here for convenience. Kept as a lazy accessor so importing this
+# package never pulls in Isaac Sim.
+def force_obs_wrapper_cls() -> Callable[..., Any]:
+    """Return the :class:`ForceObsWrapper` class (imported lazily)."""
+    from wrappers.force_obs_wrapper import ForceObsWrapper
+
+    return ForceObsWrapper
+
+
 # name -> "module.ClassName". Resolved lazily by ``make_wrapper``.
 _REGISTRY: dict[str, str] = {
     "lift": "wrappers.lift_success.LiftSuccessWrapper",
