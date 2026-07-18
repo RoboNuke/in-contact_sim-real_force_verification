@@ -75,7 +75,8 @@ _SHM_TAU_J   = (30,  37)   # joint torques [7]
 _SHM_FT_EMA  = (37,  43)   # EMA-filtered F/T [6]
 _SHM_JAC     = (43,  85)   # Jacobian 6x7 flat [42]
 _SHM_MASS    = (85,  134)  # Mass matrix 7x7 flat [49]
-_SHM_STATE_SIZE = 134
+_SHM_GRAVITY = (134, 141)  # gravity torque g(q) [7]
+_SHM_STATE_SIZE = 141
 
 _SHM_TORQUE_SIZE = 7
 _SHM_WRENCH = (7, 13)            # task_wrench [6] (compute process writes)
@@ -110,6 +111,7 @@ def _build_snapshot_from_shm(state_shm, device):
     ft_ema = list(state_shm[_SHM_FT_EMA[0]:_SHM_FT_EMA[1]])
     jac_flat = list(state_shm[_SHM_JAC[0]:_SHM_JAC[1]])
     mass_flat = list(state_shm[_SHM_MASS[0]:_SHM_MASS[1]])
+    grav_flat = list(state_shm[_SHM_GRAVITY[0]:_SHM_GRAVITY[1]])
 
     ee_pos = torch.tensor([T[12], T[13], T[14]], device=device, dtype=torch.float32)
 
@@ -126,6 +128,7 @@ def _build_snapshot_from_shm(state_shm, device):
 
     jacobian = torch.tensor(jac_flat, device=device, dtype=torch.float32).reshape(7, 6).T
     mass_matrix = torch.tensor(mass_flat, device=device, dtype=torch.float32).reshape(7, 7)
+    gravity = torch.tensor(grav_flat, device=device, dtype=torch.float32)
 
     # EE velocity: J @ dq
     dq_t = joint_vel.unsqueeze(1)  # [7, 1]
@@ -148,7 +151,7 @@ def _build_snapshot_from_shm(state_shm, device):
 
     return StateSnapshot(
         ee_pos, ee_quat, ee_linvel, ee_angvel, force_torque,
-        joint_pos, joint_vel, joint_torques, jacobian, mass_matrix,
+        joint_pos, joint_vel, joint_torques, jacobian, mass_matrix, gravity,
     )
 
 
@@ -246,6 +249,9 @@ def _comm_process_fn(state_shm, torque_shm, cmd_queue, response_queue,
         state_shm[_SHM_FT_EMA[0]:_SHM_FT_EMA[1]] = ft_ema
         state_shm[_SHM_JAC[0]:_SHM_JAC[1]] = jac_flat
         state_shm[_SHM_MASS[0]:_SHM_MASS[1]] = mass_flat
+        # gravity torque g(q) from the libfranka model (Model.gravity); `model` is
+        # in the comm-process closure. Captured so the est's can be gravity-removed.
+        state_shm[_SHM_GRAVITY[0]:_SHM_GRAVITY[1]] = model.gravity(state)
 
     # --- Main command loop ---
     try:

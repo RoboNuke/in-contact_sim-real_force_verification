@@ -29,7 +29,8 @@ StateSnapshot = namedtuple('StateSnapshot', [
     'joint_torques',    # [7] torch.float32
     'jacobian',         # [6,7] torch.float32
     'mass_matrix',      # [7,7] torch.float32
-])
+    'gravity',          # [7] torch.float32 gravity torque g(q); None if not captured
+], defaults=[None])
 
 
 class SafetyViolation(Exception):
