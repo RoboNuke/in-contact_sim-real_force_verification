@@ -1,119 +1,75 @@
 # Real-robot FORGE peg-insert evaluation config (FR3).
 #
-# Drives a locally-trained SAC FORGE policy on hardware via the vendored
-# FrankaInterface + the tested ControlTargets pose path (the same 1 kHz control
-# loop as contact_force_test.py). See real_robot_scripts/README.md.
-#
-# The `robot:` block matches config.yaml (the contact-force test) — the interface
-# only reads this sub-block. All other blocks are consumed by peg_insert_eval.py.
-# Training-derived values (obs_order, action bounds, gains) are duplicated here so
-# they can be tuned for hardware without touching the trained checkpoint; the
-# defaults reproduce the sim FORGE settings.
+# This file holds ONLY values that are unique to the real robot. Everything
+# training-derived that varies per run (model architecture, break_force, force-obs
+# mode) is read from the run's runtime_config.yaml (downloaded from wandb or read
+# from the local run dir; see run_config.py). FORGE task constants (obs_order,
+# action bounds, action EMA, force_threshold, default joint pose) are FORGE-fixed
+# and live in forge_defaults.py. See real_robot_scripts/README.md.
 
 robot:
   ip: "192.168.1.11"
   use_mock: false             # true -> mock_pylibfranka (off-hardware dry run)
   control_rate_hz: 15.0       # policy step rate; must match training (15 Hz)
-  reset_duration_sec: 3.0     # Cartesian move time for reset_to_start_pose
-  gripper_force_n: 60.0       # grasp force (<= 70 N continuous limit)
-
-  # NE_T_EE / EE_T_K identity: F_T_NE (set in Franka Desk) already carries
-  # R_z(-45 deg) + T_z(0.1034), matching sim's panda_hand frame, so O_T_EE / the
-  # Jacobian reference the fingertip midpoint with the sim orientation.
+  reset_duration_sec: 3.0
+  gripper_force_n: 60.0
   NE_T_EE: [1.0, 0.0, 0.0, 0.0,  0.0, 1.0, 0.0, 0.0,  0.0, 0.0, 1.0, 0.0,  0.0, 0.0, 0.0, 1.0]
   EE_T_K:  [1.0, 0.0, 0.0, 0.0,  0.0, 1.0, 0.0, 0.0,  0.0, 0.0, 1.0, 0.0,  0.0, 0.0, 0.0, 1.0]
+  ft_ema_alpha: 0.08
+  ft_bias: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]   # re-tared per episode
+  ft_calibration_duration_sec: 2.0
 
-  ft_ema_alpha: 0.08          # F/T EMA low-pass at 1 kHz (alpha=0.08 ~ 13 Hz)
-  ft_bias: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]   # re-tared per episode; left zero
-  ft_calibration_duration_sec: 2.0          # seconds averaged per per-episode tare
-
-# ---------------------------------------------------------------------------
 # Task / goal — SET fixed_asset_position via calibrate_goal.py before running.
-# ---------------------------------------------------------------------------
+# (break_force is NOT here — it comes from the run's runtime_config, e.g. 10 N.
+#  Set task.break_force_threshold only to deliberately override, with a warning.)
 task:
-  # Hole-entrance obs frame (world-frame EE/fingertip position at the hole mouth).
-  # This is FORGE's fixed_pos_obs_frame; obs term fingertip_pos_rel_fixed = ee_pos - this.
-  # Captured + written by calibrate_goal.py.
-  fixed_asset_position: [0.60, 0.0, 0.20]
+  fixed_asset_position: [0.60, 0.0, 0.20]        # hole-entrance obs frame (calibrated)
+  target_peg_base_position: [0.60, 0.0, 0.175]   # seated peg base (calibrated)
+  ee_to_peg_base_offset: [0.0, 0.0, -0.025]      # fingertip -> peg base (measure)
+  hole_height: 0.025
+  xy_centering_threshold: 0.0025
+  success_threshold: 0.2                          # success z-disp < hole_height * this
+  episode_timeout_steps: 150
+  terminate_on_success: true
 
-  # Peg-base target when fully seated (for success detection). Written by
-  # calibrate_goal.py = captured seated EE pos + ee_to_peg_base_offset.
-  target_peg_base_position: [0.60, 0.0, 0.175]
-
-  # Offset from the fingertip midpoint (EE) to the grasped peg's base, world z is
-  # negative (peg extends below the fingertips). Measure for your peg + grasp.
-  ee_to_peg_base_offset: [0.0, 0.0, -0.025]
-
-  hole_height: 0.025               # m; scales the success z-threshold
-  xy_centering_threshold: 0.0025   # m; peg-base xy must be within this of target
-  success_threshold: 0.2           # success z-disp < hole_height * this (=5 mm)
-  break_force_threshold: 25.0      # N; ||force[:3]|| >= this => BREAK (breakable_peg_cfg.break_force)
-
-  episode_timeout_steps: 150       # max policy steps per episode (10 s @ 15 Hz)
-  terminate_on_success: true       # stop the episode on first success (real robot)
-
-# ---------------------------------------------------------------------------
-# Observation constants (must match what the policy trained with).
-# ---------------------------------------------------------------------------
-obs:
-  # The force_threshold obs channel = FORGE contact-penalty threshold. In sim this
-  # is sampled per episode from contact_penalty_threshold_range=[5,10]; at eval we
-  # feed the fixed midpoint.
-  force_threshold: 7.5
-
-# ---------------------------------------------------------------------------
-# Control — FORGE action mapping + task-space PD pose controller (ControlTargets).
-# Defaults reproduce sim FORGE; gains may need softening for hardware stability.
-# ---------------------------------------------------------------------------
+# Real-robot task-space PD pose gains (hardware-tuned; sim FORGE default is
+# [100,100,100,30,30,30], deriv = 2*sqrt(kp)). mass_weighting=false matches the
+# sim controller (plain J^T). ema_factor optionally overrides the FORGE default.
 control:
-  # FORGE action-mapping constants (forge_env._apply_action / factory ctrl cfg).
-  ema_factor: 0.0625               # fixed action EMA (sim range [0.025,0.1] midpoint)
-  pos_action_bounds: [0.05, 0.05, 0.05]
-  rot_action_bounds: [1.0, 1.0, 1.0]
-  pos_action_threshold: [0.02, 0.02, 0.02]   # per-step position delta clip (m)
-  rot_action_threshold: [0.097, 0.097, 0.097]  # per-step euler delta clip (rad)
-
-  # Task-space PD pose gains [Fx,Fy,Fz,Tx,Ty,Tz]. Sim default_task_prop_gains
-  # for factory/forge is [100,100,100,30,30,30]; deriv = 2*sqrt(kp) (critical).
   task_prop_gains: [100.0, 100.0, 100.0, 30.0, 30.0, 30.0]
   task_deriv_gains: [20.0, 20.0, 20.0, 10.954, 10.954, 10.954]
-
-  # Null-space (keep joints near default_dof_pos).
   kp_null: 10.0
   kd_null: 6.3245553
-
-  # Null-space target joint config (sim factory default_dof_pos_tensor).
-  default_dof_pos: [-1.3003, -0.4015, 1.1791, -2.1493, 0.4001, 1.9425, 0.4754]
-
-  # Position clamp bounds about the goal (m); generous so targets aren't clipped.
-  pos_bounds: [0.15, 0.15, 0.15]
-
-  # Wrench -> joint torque mapping. false = plain J^T (matches sim FORGE controller,
-  # realized force = wrench). true = J^T @ Lambda (inertia-weighted, ~5-7x inflated).
-  # Keep false for sim-matched force scaling. See memory: sim-real 5x J^T vs J^T*Lambda.
+  pos_bounds: [0.15, 0.15, 0.15]     # safety clamp about the goal (m)
   mass_weighting: false
+  # ema_factor: 0.0625               # uncomment to override the FORGE default
 
-# ---------------------------------------------------------------------------
 # Episode reset — start pose above the hole + optional randomization.
-# ---------------------------------------------------------------------------
 reset:
-  hand_init_pos: [0.0, 0.0, 0.047]         # m; nominal EE start offset above the goal
-  hand_init_pos_noise: [0.005, 0.005, 0.0] # m; uniform +/- per axis (small for real)
-  hand_init_orn: [3.14159, 0.0, 0.0]       # RPY rad; gripper pointing down
-  hand_init_orn_noise: [0.0, 0.0, 0.0]     # RPY rad; uniform +/- (yaw last)
-  goal_pos_noise: [0.0, 0.0, 0.0]          # m; per-episode obs-frame goal noise std
-  retract_height_m: 0.03                   # m; lift before moving to a new start pose
+  hand_init_pos: [0.0, 0.0, 0.047]
+  hand_init_pos_noise: [0.005, 0.005, 0.0]
+  hand_init_orn: [3.14159, 0.0, 0.0]
+  hand_init_orn_noise: [0.0, 0.0, 0.0]
+  retract_height_m: 0.03
 
-# ---------------------------------------------------------------------------
-# Policy sampling.
-# ---------------------------------------------------------------------------
 policy:
-  std_scale: 0.0                 # 0 = deterministic (tanh mean); >0 = stochastic
+  std_scale: 0.0                     # 0 = deterministic (tanh mean)
 
-# ---------------------------------------------------------------------------
-# wandb logging (training logs to project forge_pih).
-# ---------------------------------------------------------------------------
+# RealSense capture (used only with --with_step_data). Saved locally, not to wandb.
+camera:
+  width: 640
+  height: 480
+  fps: 30
+  overlay: true                      # burn step/force/outcome telemetry into the mp4
+  serial: null                       # specific device serial, or null for the first
+
+# Local output for --with_step_data (per-step DataFrames + videos).
+data_dir: data/real_robot_eval
+
+# wandb: the eval is logged as a sibling of the training run (same project/group/
+# tags + a real_robot_eval tag). Leave project/entity null to inherit them from the
+# run's runtime_config. Only aggregate Eval_Core/* metrics are uploaded.
 wandb:
-  project: forge_pih
-  entity: null                   # e.g. "hur"; null uses your default wandb login
-  tags: ["eval_real_robot"]
+  project: null
+  entity: null
+  extra_tags: []

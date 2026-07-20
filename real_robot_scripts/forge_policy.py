@@ -21,24 +21,8 @@ import re
 
 import torch
 
-from configs.manager import ConfigManager
 from models.block_simba import BlockSimBaActor, assign_block_slice
 from real_robot_scripts.observation_builder import ObservationNormalizer
-
-
-def _find_agent_config(run_dir: str, agent_idx: int) -> str:
-    """Locate the dumped config.yaml for an agent folder (or the run root)."""
-    candidates = [
-        os.path.join(run_dir, str(agent_idx), "config.yaml"),
-        os.path.join(run_dir, "config.yaml"),
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    raise FileNotFoundError(
-        f"No config.yaml found for agent {agent_idx} under {run_dir}. "
-        f"Looked in: {candidates}"
-    )
 
 
 def _find_checkpoint(run_dir: str, agent_idx: int, step) -> str:
@@ -75,25 +59,34 @@ class ForgePolicy:
     Args:
         run_dir: Path to a training run directory (contains ``<agent>/checkpoints``)
                  or directly a single-agent folder.
+        config: The resolved training config dict (from
+                ``run_config.resolve_runtime_config``): ``model_cfg`` /
+                ``sac_cfg`` / ``breakable_peg_cfg`` / ``force_obs_cfg``.
         agent_idx: Which block-parallel agent slot to load.
         step: Checkpoint step (None = latest).
         action_dim: Env action dimension (FORGE = 7).
         device: Torch device.
     """
 
-    def __init__(self, run_dir: str, agent_idx: int = 0, step=None,
+    def __init__(self, run_dir: str, config: dict, agent_idx: int = 0, step=None,
                  action_dim: int = 7, device: str = "cpu"):
         self.device = device
         self.action_dim = int(action_dim)
 
-        cfg_path = _find_agent_config(run_dir, agent_idx)
         ckpt_path = _find_checkpoint(run_dir, agent_idx, step)
-        print(f"[ForgePolicy] config:     {cfg_path}")
         print(f"[ForgePolicy] checkpoint: {ckpt_path}")
 
-        loaded = ConfigManager.load(cfg_path)
-        self.model_cfg = loaded["model_cfg"]
-        self.sac_cfg = loaded["sac_cfg"]
+        self.model_cfg = config["model_cfg"]
+        self.sac_cfg = config["sac_cfg"]
+        # Training-derived break threshold (authoritative; e.g. 10 N).
+        self.break_force = float(config["breakable_peg_cfg"].break_force)
+        force_obs = config["force_obs_cfg"]
+        if getattr(force_obs, "history_enabled", False):
+            raise NotImplementedError(
+                "This checkpoint trained with force-obs history "
+                f"(history_length={force_obs.history_length}); the real ObservationBuilder "
+                "assembles only the stock FORGE obs. Add history support before evaluating it."
+            )
 
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         for key in ("policy", "observation_preprocessor"):
@@ -125,7 +118,8 @@ class ForgePolicy:
               f"action_dim={self.action_dim}, "
               f"continuous_dims={self.policy.continuous_dims}, "
               f"force_zero_dims={self.policy.force_zero_dims}, "
-              f"predict_success={self.sac_cfg.predict_success}")
+              f"predict_success={self.sac_cfg.predict_success}, "
+              f"break_force={self.break_force} N")
 
     @torch.no_grad()
     def get_action(self, obs: torch.Tensor, std_scale: float = 0.0) -> torch.Tensor:
