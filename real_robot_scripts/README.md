@@ -137,3 +137,103 @@ cell is a dict of the built-in high-rate buffer: `time_ms`, `ee_pos`, `ee_quat`,
   `gain` also rescales the depth-per-force, keeping `force = gain × depth`).
 - Ctrl-C or any safety violation stops the robot on the next comm timeout;
   `shutdown()` always runs.
+
+---
+
+# Real-robot FORGE peg-insert policy evaluation
+
+Runs a locally-trained SAC **FORGE peg-insert** policy (the breakable-peg task) on
+the real FR3 for a batch of insertion episodes and logs metrics to wandb. Unlike
+the contact-force push test above, this drives the arm from the **policy** each
+15 Hz step, using the same vendored `FrankaInterface` and the tested
+`ControlTargets` pose path (`sel_matrix=0` ⇒ pure task-space PD).
+
+## Files
+
+| file | purpose |
+|------|---------|
+| `eval_config.yaml` | robot connection, calibrated goal, control gains, obs constants, reset/noise, wandb |
+| `calibrate_goal.py` | capture the hole goal from a hand-guided pose and write it into `eval_config.yaml` |
+| `peg_insert_eval.py` | the eval driver (loads a checkpoint, runs episodes, logs `Eval_Core/*`) |
+| `observation_builder.py` | assembles the 24-D FORGE policy observation from a state snapshot |
+| `forge_policy.py` | loads a local `ckpt_<step>.pt` into a 1-agent `BlockSimBaActor` (deterministic action) |
+| `forge_action_map.py` | replicates FORGE `_apply_action` (action → EE pose target, EMA + clipping) |
+| `run_peg_insert_eval.sh` | step-by-step runner: `dry` / `calibrate` / `readstate` / `smoke` / `full` |
+
+## What it reproduces from sim
+
+- **Obs (24-D):** `fingertip_pos_rel_fixed(3), fingertip_quat(4), ee_linvel(3),
+  ee_angvel(3), ft_force(3), force_threshold(1)` + `prev_actions(7)` (EMA-smoothed,
+  dims 3:5 zeroed) — matching `forge_env.py::_get_observations`. `ft_force` is the
+  measured contact force; `force_threshold` is the fixed contact-penalty threshold
+  (`obs.force_threshold`, sim range [5,10] → midpoint 7.5).
+- **Action (7-D):** `[pos_delta(3), rot(3; roll/pitch zeroed, yaw only), success_pred(1)]`,
+  mapped to an EE pose target relative to the **fixed (hole) frame** with per-step
+  delta clipping and action EMA — matching `forge_env.py::_apply_action`. Deterministic
+  eval uses `tanh(mean)`.
+- **Break:** `‖force‖ ≥ break_force_threshold` (25 N). **Success:** geometric — peg
+  base within `xy_centering_threshold` and below the seated target by `hole_height *
+  success_threshold`.
+- **Force scaling:** `control.mass_weighting: false` (plain J^T) matches the sim
+  controller; `true` inflates force by task-space inertia (the known ~5× sim/real gap).
+
+## Environment
+
+The on-robot steps import **both** `skrl` (policy) and `pylibfranka` (FR3 driver).
+No stock env has both — add one to your robot/eval env once, e.g.:
+
+```bash
+conda activate libfranka-python && pip install skrl      # or: pip install pylibfranka into the training env
+export EVAL_ENV=libfranka-python                          # env used by run_peg_insert_eval.sh
+```
+
+The **mock dry-run** only needs `skrl`+`torch`, so the training env (`fail`) works for it.
+
+## Step-by-step
+
+Point `<ckpt>` at a training run dir (contains `<agent>/checkpoints/ckpt_*.pt` and
+`<agent>/config.yaml`), e.g. `runs/viability_test/contact_baseline`.
+
+```bash
+# 0. Off-hardware dry-run — validates checkpoint load, obs-dim match, the full loop,
+#    action mapping, metrics, and the goal write-back. No robot, no wandb.
+real_robot_scripts/run_peg_insert_eval.sh dry <ckpt>
+
+# 1. Calibrate the goal (on robot): close gripper, hand-guide the peg until FULLY
+#    SEATED in the hole, release guiding, press Enter. Writes fixed_asset_position
+#    (hole entrance) and target_peg_base_position into eval_config.yaml, then moves
+#    5 cm above the hole so you can eyeball alignment. Set task.ee_to_peg_base_offset
+#    and task.hole_height for your peg first.
+real_robot_scripts/run_peg_insert_eval.sh calibrate <ckpt>
+
+# 2. (optional) Cross-check the assembled observation against a known live pose —
+#    sanity-check ft_force sign/frame and fingertip_pos_rel_fixed before running policies.
+real_robot_scripts/run_peg_insert_eval.sh readstate <ckpt>
+
+# 3. Smoke eval — 2 episodes, no wandb. Confirm force levels vs break_force and that
+#    the motion is stable before scaling up.
+real_robot_scripts/run_peg_insert_eval.sh smoke <ckpt>
+
+# 4. Full eval — logs Eval_Core/* to wandb (project forge_pih). Pick the agent slot
+#    and episode count as needed.
+AGENT=0 NUM_EPISODES=20 real_robot_scripts/run_peg_insert_eval.sh full <ckpt>
+```
+
+`peg_insert_eval.py` takes `--checkpoint <run> --agent <i> --step <n>`
+(default: latest step), `--num_episodes`, `--std_scale` (>0 = stochastic),
+`--no_wandb`, and `--override key=value` (e.g. `robot.use_mock=true`,
+`control.task_prop_gains=[80,80,80,30,30,30]`).
+
+## Safety / notes
+
+- **Start small.** The first on-robot run should be `smoke` (2 episodes). Watch
+  `max_force` vs `break_force_threshold` (25 N) and the descent stability.
+- **Gains are tunable in `eval_config.yaml`** (`control.task_prop_gains`) without
+  touching the checkpoint. The sim default `[100,100,100,30,30,30]` may need
+  softening for hardware; per-step position moves are already delta-clipped to 2 cm.
+- The interface caps force at 50 N, slews torque ≤ 0.75 Nm/ms, and runs
+  `check_safety` every step; Ctrl-C / any safety violation stops the robot and
+  `shutdown()` always runs.
+- Success/break detection is a real-world **geometric/force proxy** (no sim
+  keypoints on hardware) — tune `task.xy_centering_threshold` / `success_threshold`
+  / `ee_to_peg_base_offset` to your fixture.
