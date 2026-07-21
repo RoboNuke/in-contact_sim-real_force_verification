@@ -1031,9 +1031,9 @@ class FrankaInterface:
         """Calibrate FT bias by averaging raw O_F_ext_hat_K at current pose.
 
         Sends calibrate_ft command to comm process. The comm process holds
-        current joint positions, settles 0.5s, records FT data for the
-        configured duration, and updates its internal ft_bias for subsequent
-        torque control sessions.
+        current joint positions, settles 0.5s, records FT data for
+        robot.ft_calibration_duration_sec, and updates its internal ft_bias for
+        subsequent torque control sessions.
 
         Must be called when robot is idle (not in torque control mode).
 

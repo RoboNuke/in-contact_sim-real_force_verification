@@ -9,10 +9,13 @@ actions, so the same policy drives the real FR3 the way it drove sim:
     Both `actions` and `prev_actions` are zeroed at episode reset
     (`factory_env.py` reset), so we seed the EMA state to zero.
 
-  * Position (`forge_env._apply_action`): the action frame is the FIXED (hole)
-    frame, not the fingertip —
-        target = fixed_frame + action[0:3] * pos_action_bounds
-    then the delta to the current fingertip is clipped to +/- pos_action_threshold.
+  * Position (`forge_env._apply_action`): the action is an INCREMENTAL step from
+    the CURRENT fingertip, scaled by pos_action_threshold; the absolute target is
+    then clipped to +/- pos_action_bounds around the fixed (hole) frame —
+        target = fingertip_pos + action[0:3] * pos_action_threshold
+        target = fixed_frame + clip(target - fixed_frame, +/- pos_action_bounds)
+    (IsaacLab naming is inverted: pos_action_threshold is the per-step SCALE and
+    pos_action_bounds is the CLIP box, not the other way around.)
 
   * Orientation: roll/pitch actions are zeroed; yaw is remapped into the joint-safe
     band  yaw = -180deg + 270deg * (a+1)/2, composed with a 180deg-about-x flip
@@ -100,7 +103,14 @@ class ForgeActionMapper:
         ee_pos = ee_pos.to(self.device, dtype=torch.float32)
         ee_quat = ee_quat.to(self.device, dtype=torch.float32)
 
-        # ---- position: fixed-frame origin, then delta-clip to the fingertip ----
+        # ---- position: FORGE semantics (forge_env._apply_action). act[0:3] is an
+        #      ABSOLUTE setpoint relative to the fixed (hole) frame, scaled by
+        #      pos_action_bounds; the per-step move from the current fingertip is then
+        #      clipped to +/- pos_action_threshold. NOTE: FORGE OVERRIDES Factory's
+        #      _apply_action — do not use the Factory (incremental) form here:
+        #        pos_actions = actions[:, 0:3] * pos_action_bounds
+        #        preclipped  = fixed_frame + pos_actions
+        #        target      = fingertip + clip(preclipped - fingertip, +/- pos_action_threshold)
         pos_actions = act[0:3] * self.pos_action_bounds
         preclipped_pos = self.goal_position + pos_actions
         delta_pos = preclipped_pos - ee_pos

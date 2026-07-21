@@ -65,11 +65,13 @@ class ObservationBuilder:
         force_threshold: float,
         action_dim: int = 7,
         obs_order: list = None,
+        history_length: int = 0,
         device: str = "cpu",
     ):
         self.obs_order = list(obs_order) if obs_order is not None else list(FORGE_OBS_ORDER)
         self.force_threshold = float(force_threshold)
         self.action_dim = int(action_dim)
+        self.history_length = int(history_length)
         self.device = device
 
         for name in self.obs_order:
@@ -79,7 +81,16 @@ class ObservationBuilder:
                     f"Known terms: {list(OBS_DIM_MAP.keys())}"
                 )
 
-        self.obs_dim = sum(OBS_DIM_MAP[n] for n in self.obs_order) + self.action_dim
+        # Force-observation history (wrappers/force_obs_wrapper): the previous
+        # `history_length` ft_force vectors, newest-first, appended flat AFTER the
+        # base obs (obs_order + prev_actions). The current ft_force stays in its slot
+        # and is rolled into the buffer each step; buffer is zeroed per episode.
+        self._force_dim = 3
+        self._hist = (torch.zeros((self.history_length, self._force_dim), device=self.device)
+                      if self.history_length > 0 else None)
+
+        self.obs_dim = (sum(OBS_DIM_MAP[n] for n in self.obs_order)
+                        + self.action_dim + self.history_length * self._force_dim)
 
         print(f"[ObservationBuilder] obs_order={self.obs_order}")
         idx = 0
@@ -88,8 +99,19 @@ class ObservationBuilder:
             print(f"  [{idx:>2}:{idx + dim:<2}] {name} (dim={dim})")
             idx += dim
         print(f"  [{idx:>2}:{idx + self.action_dim:<2}] prev_actions (dim={self.action_dim})")
+        idx += self.action_dim
+        if self.history_length > 0:
+            hd = self.history_length * self._force_dim
+            print(f"  [{idx:>2}:{idx + hd:<2}] ft_force_history (dim={hd}, "
+                  f"{self.history_length}x3 newest-first)")
         print(f"[ObservationBuilder] force_threshold={self.force_threshold}, "
-              f"obs_dim={self.obs_dim}")
+              f"history_length={self.history_length}, obs_dim={self.obs_dim}")
+
+    def reset(self):
+        """Zero the force-history buffer. Call at the start of each episode
+        (matches the sim wrapper zeroing its buffers in _reset_idx)."""
+        if self._hist is not None:
+            self._hist = torch.zeros_like(self._hist)
 
     def validate_against_checkpoint(self, checkpoint_obs_dim: int):
         """Fail loudly if the assembled obs width doesn't match the trained policy."""
@@ -150,7 +172,16 @@ class ObservationBuilder:
         pa[3:5] = 0.0
         parts.append(pa)
 
-        obs = torch.cat(parts, dim=0)
+        obs = torch.cat(parts, dim=0)   # base obs (obs_order + prev_actions)
+
+        # Force history: append the previous-n forces (newest-first, flattened) after
+        # the base obs, then roll the current ft_force into the buffer for the next
+        # step (matches force_obs_wrapper._get_observations).
+        if self.history_length > 0:
+            cur_force = components["ft_force"].to(self.device, dtype=torch.float32)
+            obs = torch.cat([obs, self._hist.reshape(-1)], dim=0)
+            self._hist = torch.cat([cur_force.unsqueeze(0), self._hist[:-1]], dim=0)
+
         if obs.shape[0] != self.obs_dim:
             raise RuntimeError(
                 f"Assembled obs has dim {obs.shape[0]}, expected {self.obs_dim}"

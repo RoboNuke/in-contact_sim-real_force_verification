@@ -129,7 +129,12 @@ def get_euler_xyz(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Te
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     yaw = torch.atan2(siny_cosp, cosy_cosp)
 
-    return roll, pitch, yaw
+    # Wrap to [0, 2*pi) to match IsaacLab/IsaacGym torch_utils.get_euler_xyz (which
+    # returns `angle % 2*pi`). The FORGE orientation clip (forge_action_map) assumes
+    # this range; with the raw atan2 range (-pi, pi] the roll flips sign at the
+    # tool-down pose (roll = pi), producing a spurious 2*pi delta that tilts the tool.
+    two_pi = 2.0 * torch.pi
+    return roll % two_pi, pitch % two_pi, yaw % two_pi
 
 
 # ============================================================================

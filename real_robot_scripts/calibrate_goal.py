@@ -11,8 +11,9 @@ be measured once per setup. This script captures them from the robot:
      out), and press Enter.
   3. It reads the fingertip pose and computes, from the seated capture:
         target_peg_base_position = ee_pos + ee_to_peg_base_offset
-        fixed_asset_position     = ee_pos + [0, 0, hole_height]   (entrance is
-                                   hole_height above the seated fingertip)
+        fixed_asset_position     = target_peg_base_position + [0, 0, hole_height]
+                                   (entrance is hole_height above the seated peg
+                                   base, matching sim's fixed_pos_obs_frame)
   4. It writes both back into the config (comments preserved).
   5. It retracts and drives to (goal XY, 5 cm above the entrance) so you can
      eyeball peg/hole alignment before running an eval.
@@ -115,8 +116,13 @@ def main():
         print(f"  Captured fingertip quat:       {[round(v, 5) for v in snap.ee_quat.tolist()]}")
 
         target_peg_base = ee_pos + ee_to_peg
-        fixed_asset_position = ee_pos.clone()
-        fixed_asset_position[2] += hole_height  # entrance = hole_height above seated fingertip
+        # Sim anchors the obs frame to the FIXED asset (hole): entrance =
+        # seated peg base + hole_height (factory_env fixed_pos_obs_frame). Build
+        # it from target_peg_base so the fingertip->peg-tip distance (ee_to_peg)
+        # is threaded through; using ee_pos directly drops it and puts the origin
+        # |ee_to_peg| too high, starting the episode above the hole.
+        fixed_asset_position = target_peg_base.clone()
+        fixed_asset_position[2] += hole_height  # entrance = hole_height above seated peg base
 
         print(f"\n  -> fixed_asset_position   (hole entrance obs frame): "
               f"{[round(v, 5) for v in fixed_asset_position.tolist()]}")

@@ -80,13 +80,11 @@ class ForgePolicy:
         self.sac_cfg = config["sac_cfg"]
         # Training-derived break threshold (authoritative; e.g. 10 N).
         self.break_force = float(config["breakable_peg_cfg"].break_force)
+        # Force-obs history length (0 if disabled). The ObservationBuilder appends this
+        # many previous ft_force vectors after the base obs. See force_obs_wrapper.
         force_obs = config["force_obs_cfg"]
-        if getattr(force_obs, "history_enabled", False):
-            raise NotImplementedError(
-                "This checkpoint trained with force-obs history "
-                f"(history_length={force_obs.history_length}); the real ObservationBuilder "
-                "assembles only the stock FORGE obs. Add history support before evaluating it."
-            )
+        self.history_length = (int(force_obs.history_length)
+                               if getattr(force_obs, "history_enabled", False) else 0)
 
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         for key in ("policy", "observation_preprocessor"):
