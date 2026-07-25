@@ -23,9 +23,9 @@ robot:
 # (break_force is NOT here — it comes from the run's runtime_config, e.g. 10 N.
 #  Set task.break_force_threshold only to deliberately override, with a warning.)
 task:
-  fixed_asset_position: [0.554999, -0.026563, 0.165009]        # hole-entrance obs frame (calibrated)
-  target_peg_base_position: [0.554999, -0.026563, 0.140009]   # seated peg base (calibrated)
-  ee_to_peg_base_offset: [0.0, 0.0, -0.041196] #-0.05] #-0.032392]   # = -(peg_height - franka_fingerpad_length)
+  fixed_asset_position: [0.554270, 0.019651, 0.165866]        # hole-entrance obs frame (calibrated)
+  target_peg_base_position: [0.554270, 0.019651, 0.140866]   # seated peg base (calibrated)
+  ee_to_peg_base_offset: [0.0, 0.0, -0.032392] #-0.041196] #-0.05]   # = -(peg_height - franka_fingerpad_length)
                                                  #   = -(0.050 - 0.017608). SIM grasp geometry
                                                  #   (get_handheld_asset_relative_pose), NOT a
                                                  #   physical fingertip->tip measurement.
@@ -40,14 +40,17 @@ task:
 # [100,100,100,30,30,30], deriv = 2*sqrt(kp)). mass_weighting=false matches the
 # sim controller (plain J^T). ema_factor optionally overrides the FORGE default.
 control:
-  #task_prop_gains: [100.0, 100.0, 100.0, 5.0, 5.0, 5.0]
-  #task_deriv_gains: [20.0, 20.0, 20.0, 4.5, 4.5, 4.5]
-  #task_prop_gains:  [565.0, 565.0, 565.0, 10.0, 10.0, 10.0]
-  #task_deriv_gains: [47.539, 47.539, 47.539, 6.3, 6.3, 6.3]
-  #task_prop_gains: [400.0, 400.0, 400.0, 15.0, 15.0, 15.0]
-  #task_deriv_gains: [40.0, 40.0, 40.0, 7.75,7.75, 7.75]
-  task_prop_gains:  [565.0, 565.0, 565.0, 20.0, 20.0, 20.0]
-  task_deriv_gains: [47.539, 47.539, 47.539, 9.0, 9.0, 9.0]
+
+
+  # adjusted rot to keep everything clean and stable
+  #task_prop_gains:  [565.0, 565.0, 565.0, 20.0, 20.0, 20.0]
+  #task_deriv_gains: [47.539, 47.539, 47.539, 9.0, 9.0, 9.0]
+  
+  # pos 400
+  task_prop_gains:  [400.0, 400.0, 400.0, 20.0, 20.0, 20.0]
+  task_deriv_gains: [40.0, 40.0, 40.0, 9.0, 9.0, 9.0]
+
+  # what was used in sim
   #task_prop_gains:  [565.0, 565.0, 565.0, 28.0, 28.0, 28.0]
   #task_deriv_gains: [47.539, 47.539, 47.539, 10.583, 10.583, 10.583]
 

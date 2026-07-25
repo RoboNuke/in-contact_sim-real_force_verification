@@ -221,6 +221,14 @@ def _comm_process_fn(state_shm, torque_shm, cmd_queue, response_queue,
             [100.0] * 7, [100.0] * 7,
             [100.0] * 6, [100.0] * 6,
         )
+        # Reset the FCI's internal impedance to Franka defaults. These gains persist
+        # on the robot across sessions/reboots and are NOT readable back via libfranka,
+        # so another user of this arm (e.g. a compliant ROS setup) can leave them soft.
+        # The JointImpedance-controlled reset/retract moves then track poorly ->
+        # motion-generator velocity/acceleration-discontinuity reflexes. Force known-good
+        # gains so behavior is independent of whatever the previous session left.
+        robot.set_joint_impedance([3000.0, 3000.0, 3000.0, 2500.0, 2500.0, 2000.0, 2000.0])
+        robot.set_cartesian_impedance([3000.0, 3000.0, 3000.0, 300.0, 300.0, 300.0])
 
         model = robot.load_model()
         Torques = plf.Torques

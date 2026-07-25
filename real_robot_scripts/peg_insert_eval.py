@@ -816,6 +816,7 @@ def main():
     cal_goal[2] += 0.05
     cal_pose = make_ee_target_pose(cal_goal.cpu().numpy(), np.array(hand_init_orn))
     print("\nMoving to calibration pose (goal XY, 5cm above goal Z)...")
+    robot.error_recovery()          # clear any reflex latched by a prior crash
     robot.retract_up(retract_height)
     robot.reset_to_start_pose(cal_pose)
     snap = robot.get_state_snapshot()
