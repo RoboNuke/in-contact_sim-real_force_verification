@@ -1,0 +1,148 @@
+# =============================================================================
+# FORCE-IMPORTANCE ABLATION — condition: "proprio_only"
+#   No force observation: ft_force is dropped from BOTH the actor (obs_order) and
+#   the critic (state_order). Otherwise identical to base FORGE peg-insert.
+#   Peg is breakable at 15 N.
+#   NOTE: force_threshold (the contact-penalty threshold scalar) is KEPT in both,
+#   to stay minimally different from base FORGE. If you want a strict proprio-only
+#   space with no force-domain inputs at all, also drop "force_threshold" from the
+#   obs_order and state_order overrides below.
+# =============================================================================
+# Forge Peg Insertion — Isaac Lab direct-API task. action_space=7, state=72
+# (asymmetric actor-critic auto-detected). Episode: 10s @ 15Hz = 150 steps.
+# Every registered ConfigManager header must appear; unknown keys are hard errors.
+
+runner_cfg:
+  task: Isaac-Forge-PegInsert-Direct-v0
+  env_cfg_overrides:                  # drop ft_force from BOTH actor (obs_order) and critic (state_order)
+    obs_order:
+      - fingertip_pos_rel_fixed
+      - fingertip_quat
+      - ee_linvel
+      - ee_angvel
+      - force_threshold
+    state_order:                      # base FORGE state_order minus ft_force
+      - fingertip_pos
+      - fingertip_quat
+      - ee_linvel
+      - ee_angvel
+      - joint_pos
+      - held_pos
+      - held_pos_rel_fixed
+      - held_quat
+      - fixed_pos
+      - fixed_quat
+      - task_prop_gains
+      - ema_factor
+      - pos_threshold
+      - rot_threshold
+      - force_threshold
+  num_envs: 256                     # Forge default scene num_envs is 128; can scale up
+  num_agents: 3
+  total_timesteps: 20_000           # env.step() calls; transitions = total_timesteps * num_envs * num_agents
+  eval_timesteps: 150               # env.step() calls (~1 PegInsert episode at 150 steps)
+  memory_size: 1_000_000            # replay buffer capacity PER AGENT
+  seed: -1                          # -1 = non-deterministic
+
+joint_obs_cfg:                      # append arm joint torques to the obs (see JointObsCfg)
+  enabled: false                    # master toggle; when false the wrapper is not applied
+  source: measured                  # "measured" (projected joint forces, real-sensor analog) | "commanded" (controller torque)
+  num_joints: 7                     # Franka arm DOFs appended (each adds one obs dim)
+  include_critic: true              # also append joint torques to the critic state
+
+breakable_peg_cfg:                  # break the peg past a contact-force threshold (see BreakablePegCfg)
+  enabled: true                     # master toggle; non-FORGE tasks leave this false
+  break_force: 15.0                 # N; must exceed max(contact_penalty_threshold_range) + force_margin
+  peg_break_rew: 0.0               # reward added on the breaking step (0 = terminate only, no penalty)
+  force_margin: 1.0                 # required N gap above FORGE's contact-penalty threshold (validated at init)
+
+force_obs_cfg:                      # FORGE force-observation wrapper (see ForceObsCfg)
+  enabled: false                    # master toggle; false => stock FORGE ft_force
+  force_source: contact             # "contact" (FORGE sensor) | "dyn_pinv" (J-inv from joint torques, no EMA)
+  history_enabled: false            # append last N force vectors to policy+critic obs
+  history_length: 0                 # N (obs grows by N*3 when history_enabled)
+
+sac_cfg:
+  gradient_steps: 2
+  batch_size: 2048
+  discount_factor: 0.99
+  polyak: 0.005
+  actor_lr: 1.0e-4                  # AdamW
+  critic_lr: 1.0e-4                 # AdamW
+  entropy_lr: 1.0e-4                # AdamW (weight_decay always 0 for entropy)
+  weight_decay: 1.0e-2              # decoupled weight decay applied to actor + critic
+  random_timesteps: 0
+  learning_starts: 300
+  learn_entropy: true
+  initial_entropy_value: 1.0e-2
+  target_entropy: -2.5                # null => skrl picks -|num_continuous|
+  grad_norm_clip: 0.0
+  mixed_precision: false
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: {}
+  rewards_shaper_scale: null
+  gripper_action_idx: null          # no gripper on Forge tasks
+  predict_success: true            # Forge handles success internally via the action space
+  success_td_weight: 50.0
+  success_td_discount: 0.99    # unused when predict_success=false
+  success_info_key: is_success
+  success_train_min_successes: 100
+  success_heatmap_step_bins: 30    # vertical bins on success/fail P-mean heatmaps;
+                                    # set to max_episode_length for one row per step
+  success_wrapper: null             # auto-detect "forge" wrapper from task prefix
+  recorder:
+    enabled: false                  # TiledCamera unusable on this IsaacSim/driver/GPU combo;
+                                    # see configs/exp_cfgs/default.yaml for the full block.
+  experiment:
+    directory: forge_pih
+    experiment_name: force_imp_clearance_proprio_only
+    write_interval: 150             # one episode per write
+    checkpoint_interval: auto
+
+model_cfg:
+  actor:
+    act_init_std: 1.0
+    actor_n: 1
+    actor_latent: 128
+    last_layer_scale: 0.1           # tiny init → small initial actions, less tanh saturation
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    reduction: sum
+    use_state_dependent_std: false
+    bernoulli_action_dims: null     # all-continuous (no binary gripper)
+    force_zero_action_dims: [3, 4]  # Forge sets actions[:, 3:5] = 0 internally
+  critic:
+    critic_output_init_mean: 0.0
+    critic_n: 2
+    critic_latent: 1024
+    clip_actions: false
+
+rescue_buffer_cfg:
+  enabled: false                  # master toggle; when false, runner skips all rescue construction
+  # ---- Algorithm 1 hyperparameters (required even when disabled — fail-loud convention) ----
+  tau: 0.7                         # f_phi(s_t) >= tau ⇒ rescue-point candidate
+  delta: 0.3                       # f_phi(s_T) <= delta ⇒ trajectory eligible for rescue extraction
+  alpha: 0.25                      # P(overwrite natural reset with rescue init) per done env
+  rho_min: 0.3                     # min rolling success rate to (a) add and (b) sample
+  window_size: 256                 # rolling-window length (trajectories per agent)
+  max_buffer_size: 1024            # per-agent rescue buffer capacity
+  # ---- Algorithm extras ----
+  dead_point_min_attempts: 10
+  action_entropy_first_k_steps: 10
+  # ---- Metric publication ----
+  metric_compute_interval: 150     # must equal sac_cfg.experiment.write_interval
+  buffer_snapshot_interval: 50000
+  snapshot_dir: rescue_snapshots
+  # ---- Section 5 — diversity / clustering ----
+  nn_query_subsample_rollout: 1.0
+  nn_distance_percentiles: [5, 25, 50]
+  dbscan_eps: 2.2                 # null ⇒ auto-set to 5th-percentile pairwise dist at clustering time
+  dbscan_min_samples: 5
+  clustering_recompute_threshold: 25
+  min_buffer_size_for_clustering: 20
+  predictor_ece_n_bins: 10
+  projection_method: umap          # "umap" or "pca"
+  projection_recompute_threshold: 50
+  projection_n_neighbors: 15
+  projection_min_dist: 0.1
