@@ -1995,6 +1995,15 @@ class SAC(Agent):
             os.makedirs(ckpt_dir, exist_ok=True)
             path = os.path.join(ckpt_dir, f"ckpt_{tag}.pt")
             torch.save(self._build_per_agent_checkpoint(i, timestep), path)
+            # Mirror the checkpoint to this agent's wandb run so runs are fully
+            # reconstructable from wandb alone (each ckpt_<step>.pt is a distinct
+            # file, so this uploads every checkpoint, not just the latest). No-op
+            # for TB-only writers and when wandb is disabled; best-effort — a failed
+            # upload must never abort the local checkpoint write.
+            if i < len(self.per_agent_writers):
+                writer = self.per_agent_writers[i]
+                if hasattr(writer, "save_file_live"):
+                    writer.save_file_live(path)
 
     # --- load helpers ---
     @staticmethod

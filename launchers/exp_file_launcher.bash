@@ -2,13 +2,26 @@
 # launchers/exp_file_launcher.bash — run sac_block_e2e.sh over every config in a folder.
 #
 # Usage:
-#   exp_file_launcher.bash <config_folder> [--skip_existing] [extra args passed through to sac_block_e2e.sh ...]
+#   exp_file_launcher.bash <config_folder> [--skip_existing] [--set K=V ...] \
+#       [--exp_name_suffix <s>] [extra args passed through to sac_block_e2e.sh ...]
 #
 # For each *.yaml file directly inside <config_folder> it calls:
 #   bash launchers/sac_block_e2e.sh <config_path> <exp_name> [extra args...]
 # where <exp_name> is the config filename with the .yaml suffix and the folder
 # path stripped (e.g. configs/exp_cfgs/dyn_viability_test/dyn_pinv.yaml -> dyn_pinv).
 # That <exp_name> also becomes the wandb group (see learning/metric_writer.make_wandb_run).
+#
+# --set K=V (repeatable): a generic config override applied to EVERY config in the
+# folder, forwarded verbatim to sac_block_e2e.sh -> runner.py. K is a dotted path
+# rooted at a config header (e.g. sac_cfg.actor_lr=2.0e-4, breakable_peg_cfg.break_force=12.5).
+# The override is baked into the config.yaml each run copies to disk, so the recorded
+# runtime config reflects the override, NOT the YAML default. This is the mechanism
+# param_sweep_folder.bash uses to sweep one parameter across the whole folder.
+#
+# --exp_name_suffix <s>: append <s> to every derived <exp_name> (e.g. dyn_pinv ->
+# dyn_pinv__bf12.5). Each config keeps its own experiment.directory (family), so the
+# suffix only makes the leaf run dir + wandb group unique. Used by the sweep driver
+# to keep each swept value's runs (and --skip_existing checks) separate.
 #
 # --skip_existing (launcher-only flag, not forwarded): before running a config,
 # resolve the experiment output dir the same way runner.py does
@@ -41,15 +54,26 @@ shift
 # overrides the experiment "family" dir and is needed to resolve the skip target.
 SKIP_EXISTING=0
 EXP_DIR_OVERRIDE=""
+EXP_NAME_SUFFIX=""
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip_existing) SKIP_EXISTING=1 ;;
+        --exp_name_suffix)
+            [[ $# -ge 2 ]] || { echo "[batch] --exp_name_suffix requires a value" >&2; exit 2; }
+            EXP_NAME_SUFFIX="$2"; shift ;;
         --experiment_directory)
             [[ $# -ge 2 ]] || { echo "[batch] --experiment_directory requires a value" >&2; exit 2; }
             EXP_DIR_OVERRIDE="$2"
             EXTRA_ARGS+=("$1" "$2")
             shift ;;
+        --set)
+            # Generic config override; forward the flag AND its K=V value to the
+            # per-run launcher (which forwards both to runner.py). Explicit case so
+            # the value token isn't mistaken for a positional/other flag.
+            [[ $# -ge 2 ]] || { echo "[batch] --set requires a K=V value" >&2; exit 2; }
+            [[ "$2" == *=* ]] || { echo "[batch] --set expects HEADER.path=VALUE, got '$2'" >&2; exit 2; }
+            EXTRA_ARGS+=("--set" "$2"); shift ;;
         *) EXTRA_ARGS+=("$1") ;;
     esac
     shift
@@ -127,7 +151,7 @@ PASSED=()
 SKIPPED=()
 for config_path in "${CONFIGS[@]}"; do
     base="$(basename -- "$config_path")"   # strip folder path
-    exp_name="${base%.yaml}"               # strip .yaml suffix
+    exp_name="${base%.yaml}${EXP_NAME_SUFFIX}"   # strip .yaml suffix, add optional sweep suffix
 
     # --skip_existing: if the resolved output dir already exists and is non-empty,
     # this config has already been run — skip it. If resolution fails (bad YAML,

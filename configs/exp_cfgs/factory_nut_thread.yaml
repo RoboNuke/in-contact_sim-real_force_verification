@@ -101,6 +101,12 @@ rescue_buffer_cfg:
   projection_n_neighbors: 15
   projection_min_dist: 0.1
 
+joint_obs_cfg:                      # append arm joint torques to the obs (see JointObsCfg)
+  enabled: false                    # master toggle; when false the wrapper is not applied
+  source: measured                  # "measured" (projected joint forces, real-sensor analog) | "commanded" (controller torque)
+  num_joints: 7                     # Franka arm DOFs appended (each adds one obs dim)
+  include_critic: true              # also append joint torques to the critic state
+
 breakable_peg_cfg:                  # break the peg past a contact-force threshold (see BreakablePegCfg)
   enabled: false                    # master toggle; non-FORGE tasks leave this false
   break_force: 25.0                 # N; must exceed max(contact_penalty_threshold_range) + force_margin

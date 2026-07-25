@@ -102,6 +102,24 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Overrides runner_cfg.memory_size (replay buffer per agent).")
     parser.add_argument("--seed", type=int, default=None,
                         help="Overrides runner_cfg.seed. -1 means non-deterministic.")
+    parser.add_argument(
+        "--set",
+        dest="set_overrides",
+        metavar="HEADER.dotted.path=VALUE",
+        action="append",
+        default=None,
+        help="Generic config override applied to the loaded config BEFORE it is "
+             "dumped to each run's config.yaml — so the recorded runtime config "
+             "reflects the override, not the YAML default. KEY is a dotted path "
+             "rooted at a config header, e.g. "
+             "--set sac_cfg.actor_lr=2.0e-4 "
+             "--set runner_cfg.num_envs=128 "
+             "--set model_cfg.actor.actor_latent=256 "
+             "--set breakable_peg_cfg.break_force=12.5. Repeatable. VALUE is parsed "
+             "as int, then float (so 1e-4 works), then a YAML scalar (true/false, "
+             "null, [1,2] lists), else left as a string. Strict: an unknown "
+             "attribute on a dataclass node raises so typos fail loudly.",
+    )
     AppLauncher.add_app_launcher_args(parser)  # adds --headless, --device
     return parser
 
@@ -140,6 +158,104 @@ def _apply_env_cfg_overrides(env_cfg, overrides: dict) -> None:
         print(f"[runner] env_cfg override: {dotted_path} = {value}")
 
 
+_MISSING = object()
+
+
+def _coerce_set_value(raw: str):
+    """Parse a ``--set`` VALUE string into a Python scalar.
+
+    Order matters and mirrors what the YAML config itself would carry:
+      1. ``int`` — so ``256`` stays an int, not a float.
+      2. ``float`` — critically this catches ``1e-4`` / ``2.5e3``, which PyYAML's
+         YAML-1.1 scalar rules would (surprisingly) leave as *strings*.
+      3. YAML scalar — booleans (``true``/``false``), ``null``, and inline lists
+         (``[3, 4]``) / dicts.
+      4. Fallback: the raw string unchanged.
+    """
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    import yaml as _yaml
+    try:
+        return _yaml.safe_load(raw)
+    except Exception:
+        return raw
+
+
+def _child_get(node, seg, default):
+    """Read ``seg`` from a dataclass instance (attr) or a dict (key)."""
+    if isinstance(node, dict):
+        return node.get(seg, default)
+    return getattr(node, seg, default)
+
+
+def _apply_dotted_overrides(loaded: dict, set_overrides) -> None:
+    """Apply ``--set HEADER.dotted.path=VALUE`` overrides to the loaded configs.
+
+    ``loaded`` is the ``{header: dataclass_instance}`` dict returned by
+    ``ConfigManager.load``. Because the runner later dumps this exact object to
+    each run's ``config.yaml``, mutating it here is what guarantees the recorded
+    runtime config carries the override rather than the YAML default.
+
+    The first path segment selects a config header (``sac_cfg``, ``runner_cfg``,
+    ``model_cfg``, …); the rest is resolved by ``getattr`` down the dataclass
+    tree (or ``[]`` on dict-typed fields such as ``wandb_kwargs``). Strict: an
+    unknown attribute on a dataclass node raises ``AttributeError`` so typos fail
+    loudly, matching ``_apply_env_cfg_overrides``.
+    """
+    if not set_overrides:
+        return
+    for item in set_overrides:
+        if not isinstance(item, str) or "=" not in item:
+            raise ValueError(f"--set expects HEADER.dotted.path=VALUE, got {item!r}")
+        key, raw = item.split("=", 1)
+        key = key.strip()
+        parts = key.split(".")
+        if len(parts) < 2 or not all(parts):
+            raise ValueError(
+                f"--set key must be a dotted path rooted at a config header "
+                f"(e.g. 'sac_cfg.actor_lr'), got {key!r}"
+            )
+        header = parts[0]
+        if header not in loaded:
+            raise KeyError(
+                f"--set '{key}': unknown config header '{header}'; "
+                f"expected one of {sorted(loaded)}"
+            )
+        target = loaded[header]
+        for seg in parts[1:-1]:
+            if isinstance(target, dict):
+                if seg not in target:
+                    raise KeyError(f"--set '{key}': '{seg}' not found in dict node")
+                target = target[seg]
+            elif hasattr(target, seg):
+                target = getattr(target, seg)
+            else:
+                raise AttributeError(
+                    f"--set '{key}': '{seg}' not found on {type(target).__name__}"
+                )
+        leaf = parts[-1]
+        value = _coerce_set_value(raw)
+        # Type fidelity: assigning an int literal to a float field keeps it a float.
+        existing = _child_get(target, leaf, _MISSING)
+        if isinstance(existing, float) and isinstance(value, int) and not isinstance(value, bool):
+            value = float(value)
+        if isinstance(target, dict):
+            target[leaf] = value
+        elif hasattr(target, leaf):
+            setattr(target, leaf, value)
+        else:
+            raise AttributeError(
+                f"--set '{key}': '{leaf}' not found on {type(target).__name__}"
+            )
+        print(f"[runner] --set {key} = {value!r}")
+
+
 def main() -> None:
     args = build_parser().parse_args()
 
@@ -176,6 +292,7 @@ def main() -> None:
     import torch
 
     import isaaclab_tasks  # noqa: F401  registers Isaac-* gym ids
+    import envs  # noqa: F401  registers project ids incl. Isaac-Forge-PegInsert-Clear* scaled holes
     from isaaclab_tasks.utils import parse_env_cfg
     from skrl.trainers.torch import SequentialTrainer
     from skrl.utils import set_seed
@@ -199,6 +316,7 @@ def main() -> None:
     model_cfg = loaded["model_cfg"]
     rescue_buffer_cfg = loaded["rescue_buffer_cfg"]
     force_obs_cfg = loaded["force_obs_cfg"]
+    joint_obs_cfg = loaded["joint_obs_cfg"]
     breakable_peg_cfg = loaded["breakable_peg_cfg"]
 
     # CLI > YAML for runner-level fields. Apply overrides to the loaded RunnerCfg so
@@ -210,6 +328,13 @@ def main() -> None:
     if args.eval_timesteps is not None:  runner_cfg.eval_timesteps = args.eval_timesteps
     if args.memory_size is not None:     runner_cfg.memory_size = args.memory_size
     if args.seed is not None:            runner_cfg.seed = args.seed
+
+    # Generic --set overrides. Applied AFTER the dedicated flags above (so an
+    # explicit --set wins over --num_envs et al.) and to the same `loaded` objects
+    # the runner dumps to disk below — this is what puts the override into every
+    # run's copied config.yaml. Runs before all downstream config-dependent logic
+    # so overridden values take effect for this run, not just the recorded dump.
+    _apply_dotted_overrides(loaded, args.set_overrides)
 
     # In eval mode the trainer runs for runner_cfg.eval_timesteps instead of total_timesteps.
     effective_total_timesteps = (
@@ -345,6 +470,19 @@ def main() -> None:
             f"[runner] ForceObsWrapper: source={force_obs_cfg.force_source} "
             f"history_enabled={force_obs_cfg.history_enabled} "
             f"history_length={force_obs_cfg.history_length}"
+        )
+    # Optional joint-torque observation (proprio_jnts ablation). Appends the arm
+    # joint torques to the policy (and optionally critic) obs. Applied to the RAW
+    # gym env BELOW the skrl wrapper, and AFTER ForceObsWrapper so it chains that
+    # wrapper's _get_observations hook rather than the base env's.
+    if joint_obs_cfg.enabled:
+        from wrappers.joint_obs_wrapper import JointObsWrapper
+
+        env = JointObsWrapper(env, joint_obs_cfg)
+        print(
+            f"[runner] JointObsWrapper: source={joint_obs_cfg.source} "
+            f"num_joints={joint_obs_cfg.num_joints} "
+            f"include_critic={joint_obs_cfg.include_critic}"
         )
     # Optional breakable-peg mechanics (stock FORGE tasks only). Terminates an env
     # when its smoothed contact-force magnitude exceeds break_force and resets just

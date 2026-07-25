@@ -20,6 +20,7 @@ import yaml
 
 from configs.manager.breakable_peg_cfg import BreakablePegCfg
 from configs.manager.force_obs_cfg import ForceObsCfg
+from configs.manager.joint_obs_cfg import JointObsCfg
 from configs.manager.model_cfg import ModelCfg
 from configs.manager.rescue_buffer_cfg import RescueBufferCfg
 from configs.manager.runner_cfg import RunnerCfg
@@ -83,6 +84,7 @@ class ConfigManager:
         "model_cfg": ModelCfg,
         "rescue_buffer_cfg": RescueBufferCfg,
         "force_obs_cfg": ForceObsCfg,
+        "joint_obs_cfg": JointObsCfg,
         "breakable_peg_cfg": BreakablePegCfg,
     }
 

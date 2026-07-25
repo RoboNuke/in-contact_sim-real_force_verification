@@ -2,14 +2,18 @@
 # launchers/sac_block_e2e.sh — full train -> save -> load -> eval smoke test.
 #
 # Usage:
-#   sac_block_e2e.sh <config_path> <experiment_name> [--no_eval]
+#   sac_block_e2e.sh <config_path> <experiment_name> [--no_eval] [--set K=V ...]
 #
 # Reads task / num_envs / num_agents / total_timesteps / eval_timesteps / memory_size
 # from runner_cfg in the supplied YAML. Override anything one-off via runner CLI flags
 # in the python invocations below.
 #
 # Flags:
-#   --no_eval   Skip the post-training eval pass (still verifies checkpoints exist).
+#   --no_eval    Skip the post-training eval pass (still verifies checkpoints exist).
+#   --set K=V    Generic config override forwarded verbatim to runner.py (repeatable).
+#                Dotted path rooted at a config header, e.g.
+#                --set sac_cfg.actor_lr=2.0e-4 --set runner_cfg.num_envs=128.
+#                The override is baked into the config.yaml each run copies to disk.
 #
 # Fail loud, fail fast: any silent miss is a bug, not an expected outcome.
 set -Eeuo pipefail
@@ -28,6 +32,7 @@ RUN_EVAL=1
 EXPERIMENT_DIRECTORY=""
 WANDB_TAG_FLAGS=()   # collected --wandb_tag flags, forwarded verbatim to runner.py
 WANDB_PROJECT_FLAG=()   # --wandb_project flag, forwarded verbatim to runner.py
+SET_FLAGS=()   # collected --set K=V overrides, forwarded verbatim to runner.py
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no_eval) RUN_EVAL=0 ;;
@@ -40,6 +45,10 @@ while [[ $# -gt 0 ]]; do
         --wandb_project)
             [[ $# -ge 2 ]] || { echo "[launcher] --wandb_project requires a value" >&2; exit 2; }
             WANDB_PROJECT_FLAG=(--wandb_project "$2"); shift ;;
+        --set)
+            [[ $# -ge 2 ]] || { echo "[launcher] --set requires a K=V value" >&2; exit 2; }
+            [[ "$2" == *=* ]] || { echo "[launcher] --set expects HEADER.path=VALUE, got '$2'" >&2; exit 2; }
+            SET_FLAGS+=("--set" "$2"); shift ;;
         *) echo "[launcher] unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -125,6 +134,7 @@ TRAIN_RC=0
     "${EXP_DIR_FLAG[@]}" \
     "${WANDB_TAG_FLAGS[@]}" \
     "${WANDB_PROJECT_FLAG[@]}" \
+    "${SET_FLAGS[@]}" \
     --mode train \
     --headless || TRAIN_RC=$?
 
@@ -168,6 +178,7 @@ if [[ "$RUN_EVAL" -eq 1 ]]; then
         "${EXP_DIR_FLAG[@]}" \
         "${WANDB_TAG_FLAGS[@]}" \
         "${WANDB_PROJECT_FLAG[@]}" \
+        "${SET_FLAGS[@]}" \
         --checkpoint "$EXP_DIR" \
         --mode eval \
         --headless
